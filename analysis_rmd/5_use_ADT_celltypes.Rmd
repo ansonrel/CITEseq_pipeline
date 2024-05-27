@@ -1,0 +1,371 @@
+---
+title: "Look at Expression markers in ADT-defined celltypes"
+author: "Stephany Orjuela & Anthony Sonrel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
+torun = TRUE
+# TODO for compiling: 
+.libPaths(c("/usr/local/lib/R/site-library", "/usr/local/lib/R/library", "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0"))
+```
+
+## Load packages
+
+
+```{r}
+suppressPackageStartupMessages({
+ library(SingleCellExperiment, lib.loc = "/usr/local/lib/R/site-library")
+ library(scater, lib.loc = "/usr/local/lib/R/site-library")
+ library(purrr, lib.loc = "/usr/local/lib/R/site-library")  
+ library(data.table, lib.loc = "/usr/local/lib/R/site-library")
+ library(ComplexHeatmap, lib.loc = "/usr/local/lib/R/site-library")
+ library(CATALYST, lib.loc = "/usr/local/lib/R/site-library")
+ library(monocle3, lib.loc = "/usr/local/lib/R/site-library")
+ library(scran, lib.loc = "/usr/local/lib/R/site-library")
+ library(patchwork, lib.loc = "/usr/local/lib/R/site-library")
+ library(ggridges, lib.loc = "/usr/local/lib/R/site-library")
+   library(RColorBrewer, lib.loc = "/usr/local/lib/R/site-library")
+ library(circlize, lib.loc = "/usr/local/lib/R/site-library")
+ library(patchwork, lib.loc = "/usr/local/lib/R/site-library")
+ })
+
+#load object after manual annotation
+d <- readRDS("sce/d_adt_clust.rds")
+
+```
+
+## merge clusters with manual clustering
+```{r}
+mergetab <- read.csv("manual_annotation_131221.csv", header = TRUE, stringsAsFactors = FALSE)
+```
+
+
+```{r}
+metadata(altExp(d))$cluster_codes <- data.frame(
+  custom = factor(levels(altExp(d)$cluster_id)))
+
+metadata(altExp(d))$cluster_codes$merging_louvain <- factor(mergetab$new_cluster)
+head(cluster_codes(altExp(d)))
+```
+
+
+## ADT-based UMAP with ADT annotations
+
+```{r, fig.width = 10, fig.height= 10}
+plotExprHeatmap(altExp(d), by = "cluster_id", k = "custom", m = "merging_louvain",
+                scale = "first", row_clust = FALSE, assay = "CLRcounts",
+                features = "type")
+
+source("scripts/getUMAPclusters.R")
+by_text <- getUMAPclusters(altExp(d), meta = "merging_louvain") 
+
+plotDR(altExp(d), color_by="merging_louvain", assay = "CLRcounts") + 
+  geom_point(alpha = 0.3, size = 0.5) +
+  annotate("text", x=by_text$x, y=by_text$y, label=names(by_text$x), size = 5)
+
+```
+
+## Relative population abundances
+```{r, fig.width = 10, fig.height= 10}
+# change order showing conditions
+altExp(d)$condition <- factor(altExp(d)$condition, levels =  c("none", "LPS", "S1P", "LPS_S1P"))
+plotAbundances(altExp(d), k = "merging_louvain", by = "sample_id", 
+               group_by = "condition") +xlab("sample")
+plotAbundances(altExp(d), k = "merging_louvain", by = "cluster_id", 
+               group_by = "condition")
+
+```
+
+
+## RNA-based UMAP with ADT annotations
+
+```{r, fig.width = 10, fig.height= 10}
+d$cluster_ADT <- factor(cluster_ids(altExp(d), "merging_louvain"))
+by_text <- getUMAPclusters(d, coldata = "cluster_ADT", meta = NULL) 
+plotDR(d, color_by = "cluster_ADT", assay = "logcounts", dr = "UMAP") +
+  geom_point(alpha = 0.3, size = 0.5) +
+  annotate("text", x=by_text$x, y=by_text$y, label=names(by_text$x), size = 3)
+
+saveRDS(d, "sce/d_adt_annot.rds")
+```
+
+## Get RNA markers per celltype (DE analysis between celltypes)
+
+There are different ways to do this. Here we test two approaches. Whether the highly ranked genes are those that are DE between the current group and any other group ("any") or all other groups ("all"). 
+
+With `all` it's easier to visualize and more strict, because the null hypothesis is that the gene is not DE in all contrasts (1 cell type Vs each of the other). 
+
+With `any` it does not explicitly favour genes that are uniquely expressed in a cluster. Rather, it focuses on combinations of genes that - together - drive separation of a cluster from the others.
+
+*About the summary.logFC*:
+in `all`: is defined as the effect size from the pairwise comparison with the largest p-value. This reflects the fact that, with this approach, a gene is only as significant as its weakest DE.
+
+in `any`: is defined as the effect size from the pairwise comparison with the lowest p-value. The combined p-value is computed by applying Simes' method to all p-values.
+
+### Stringent method (`all`)
+
+List of markers per cluster detected: 
+
+```{r}
+
+#what are the highest expressed genes overall
+#plotHighestExprs(d, colour_cells_by= "Sample")
+
+# find markers
+d <- d[!is.na(rowData(d)$symbol),]
+rownames(d) <- rowData(d)$symbol
+testf <- "all" 
+markers <- scran::findMarkers(d,
+                              pval.type = testf,
+                              direction = "up",
+                              groups = d$cluster_ADT, 
+                              block = d$Sample)
+
+
+#organize tables to export in csv per celltype
+celltypes <- names(markers)
+samecols <- sapply(celltypes, function(u){
+    subdf <- data.frame(markers[[u]][,c("p.value","FDR","summary.logFC")])
+    
+    #choose markers below cutoff
+    subdf <- subdf[subdf$FDR < 0.05,]
+    
+    #only export tables with something
+    if(nrow(subdf) > 0) {
+    dir.create("reports/TABLES", showWarnings = FALSE)
+    write.csv(subdf, 
+              file = sprintf("reports/TABLES/DE_genes_against_%s_%s.csv",
+                             testf, u))
+    }
+  })
+
+#toexport <- dplyr::bind_rows(samecols, .id = "celltype")
+#write.csv(toexport, file = sprintf("DE_genes_against_%s_celltype.csv", testf))
+
+#get genes to plot
+mark_per_clus <- lapply(markers, function(u){
+    genes <- rownames(u[u$FDR < 0.05,])
+    if(length(genes) > 0) {
+    if(length(genes) >= 10) genes[1:10] else genes
+    }
+  })
+
+mark_per_clus
+
+
+```
+
+Median logcounts expression of top RNA markers per cluster. Mitochondrial, ribosomal and other known markers with high expression are removed. 
+
+```{r, fig.width = 12, fig.height= 10}
+
+umarks <- unique(unlist(mark_per_clus))
+
+
+#think about removing clusters with MT-makers
+#for now remove the MT markers, robosomal markers and some known markers that have high expression
+umarks <- umarks[!grepl("MT-",umarks)]
+umarks <- umarks[!grepl("\\.RP[SL]",umarks)]
+umarks <- umarks[!grepl("EEF1A1|TMSB4X|MALAT1|ACTB|FTL|B2M",umarks)]
+
+#set to plot RNA heatmap
+dsub <- d[umarks, ]
+colData(dsub) <- colData(dsub)[,c("Sample", "sample_id", "patient_id", "condition")]
+#add custom metadata
+metadata(dsub) <- metadata(altExp(d))
+colData(dsub)$cluster_id <- altExp(dsub)$cluster_id
+
+#sample heatmaps
+# plotExprHeatmap(dsub, assay = "logcounts", by = "sample_id",
+#                 bars = TRUE, row_clust = FALSE, scale = "last")
+
+#cluster heatmap
+
+plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "merging_louvain",
+                scale = "first", row_clust = FALSE, assay = "logcounts")
+```
+
+
+The following plot is also saved in the `heatmaps` folder. A scaled heatmap was also tested but didn't show a better identification of the markers on the plot. 
+
+```{r, fig.height=10, fig.width=10}
+
+
+#df for rowannotation
+dfrow <- data.frame(cluster_id = rep(names(mark_per_clus), 
+                                     lengths(mark_per_clus)))
+#subset to only clusters with some DE genes
+cellstouse <- names(mark_per_clus)[!sapply(mark_per_clus, is.null)]
+dsub <- d[,d$cluster_ADT %in% cellstouse]
+dsub$cluster_ADT <- factor(as.character(dsub$cluster_ADT))
+#png("test.png", width = 1000, height = 1500)
+pdf(sprintf("reports/HEATMAPS/heatmap_markers_long_%s.pdf", testf ), width = 11, height = 14)
+source("scripts/plotExprHeatmapLarge.R")
+set.seed(111000)
+# scale the data by z-scores (by row, genes)
+# assay(dsub, "z-score") <- t(scale(t(counts(dsub))))
+plotExprHeatmapFull(dsub, features = umarks, 
+                    drow = dfrow, #add celltypes for gene markers
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "cluster_ADT",
+                    col_clust = FALSE,
+                    row_clust = FALSE,
+                    assay = "logcounts",
+                    cells = 10000,
+                    k = "cluster_ADT",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = dsub$cluster_ADT)
+dev.off()
+plotExprHeatmapFull(dsub, features = umarks, 
+                    drow = dfrow, #add celltypes for gene markers
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "cluster_ADT",
+                    col_clust = FALSE,
+                    row_clust = FALSE,
+                    assay = "logcounts",
+                    cells = 10000,
+                    k = "cluster_ADT",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = dsub$cluster_ADT)
+
+```
+
+
+### Lenient method (`any`)
+
+List of markers per cluster detected: 
+
+```{r}
+
+#what are the highest expressed genes overall
+#plotHighestExprs(d, colour_cells_by= "Sample")
+
+# find markers
+d <- d[!is.na(rowData(d)$symbol),]
+rownames(d) <- rowData(d)$symbol
+testf <- "any" 
+markers <- scran::findMarkers(d,
+                              pval.type = testf,
+                              direction = "up",
+                              groups = d$cluster_ADT, 
+                              block = d$Sample)
+
+
+#organize tables to export in csv per celltype
+celltypes <- names(markers)
+samecols <- sapply(celltypes, function(u){
+    subdf <- data.frame(markers[[u]][,c("p.value","FDR","summary.logFC")])
+    
+    #choose markers below cutoff
+    subdf <- subdf[subdf$FDR < 0.05,]
+    
+    #only export tables with something
+    if(nrow(subdf) > 0) {
+    dir.create("reports/TABLES", showWarnings = FALSE)
+    write.csv(subdf, 
+              file = sprintf("reports/TABLES/DE_genes_against_%s_%s.csv",
+                             testf, u))
+    }
+  })
+
+#toexport <- dplyr::bind_rows(samecols, .id = "celltype")
+#write.csv(toexport, file = sprintf("DE_genes_against_%s_celltype.csv", testf))
+
+#get genes to plot
+mark_per_clus <- lapply(markers, function(u){
+    genes <- rownames(u[u$FDR < 0.05,])
+    if(length(genes) > 0) {
+    if(length(genes) >= 10) genes[1:10] else genes
+    }
+  })
+
+mark_per_clus
+
+
+```
+
+Median logcounts expression of top RNA markers per cluster. Mitochondrial, ribosomal and other known markers with high expression are removed. 
+
+```{r, fig.width = 12, fig.height= 10}
+
+mark_per_clus <- lapply(mark_per_clus, function(x){
+  x[!grepl("MT-|\\.RP[SL]|EEF1A1|TMSB4X|MALAT1|ACTB|FTL|B2M", x)]
+})
+
+umarks <- (unlist(mark_per_clus))
+# names(umarks) <- rep(names(mark_per_clus),  unlist(lapply(mark_per_clus, length)))
+
+#set to plot RNA heatmap
+dsub <- d[umarks, ]
+colData(dsub) <- colData(dsub)[,c("Sample", "sample_id", "patient_id", "condition")]
+#add custom metadata
+metadata(dsub) <- metadata(altExp(d))
+colData(dsub)$cluster_id <- altExp(dsub)$cluster_id
+
+#sample heatmaps
+# plotExprHeatmap(dsub, assay = "logcounts", by = "sample_id",
+#                 bars = TRUE, row_clust = FALSE, scale = "last")
+
+#cluster heatmap
+plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "merging_louvain",
+                scale = "first", row_clust = FALSE, assay = "logcounts")
+```
+
+
+The following plot is also saved in the `heatmaps` folder. A scaled heatmap was also tested but didn't show a better identification of the markers on the plot. 
+
+```{r, fig.height=13, fig.width=8}
+
+#df for rowannotation
+dfrow <- data.frame(cluster_id = rep(names(mark_per_clus), 
+                                     lengths(mark_per_clus)))
+#subset to only clusters with some DE genes
+cellstouse <- names(mark_per_clus)[!sapply(mark_per_clus, is.null)]
+dsub <- d[,d$cluster_ADT %in% cellstouse]
+dsub$cluster_ADT <- factor(as.character(dsub$cluster_ADT))
+#png("test.png", width = 1000, height = 1500)
+pdf(sprintf("reports/HEATMAPS/heatmap_markers_long_%s.pdf", testf ), width = 11, height = 14)
+source("scripts/plotExprHeatmapLarge.R")
+set.seed(111000)
+# scale the data by z-scores (by row, genes)
+# assay(dsub, "z-score") <- t(scale(t(counts(dsub))))
+plotExprHeatmapFull(dsub, features = umarks, 
+                    drow = dfrow, #add celltypes for gene markers
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "cluster_ADT",
+                    col_clust = FALSE,
+                    row_clust = FALSE,
+                    assay = "logcounts",
+                    cells = 10000,
+                    k = "cluster_ADT",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = dsub$cluster_ADT)
+dev.off()
+plotExprHeatmapFull(dsub, features = umarks, 
+                    drow = dfrow, #add celltypes for gene markers
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "cluster_ADT",
+                    col_clust = FALSE,
+                    row_clust = FALSE,
+                    assay = "logcounts",
+                    cells = 10000,
+                    k = "cluster_ADT",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = dsub$cluster_ADT)
+
+```
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,578 @@
+---
+title: "Monocle3 pseudotime analysis"
+author: "Anthony Sonrel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"), warning=FALSE)
+# TODO for compiling: 
+.libPaths(c("/usr/local/lib/R/site-library", "/usr/local/lib/R/library", "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0"))
+```
+
+
+```{r, warning=FALSE}
+suppressPackageStartupMessages({
+ library(SingleCellExperiment, lib.loc = "/usr/local/lib/R/site-library")
+ library(scater, lib.loc = "/usr/local/lib/R/site-library")
+ library(purrr, lib.loc = "/usr/local/lib/R/site-library")  
+ library(data.table, lib.loc = "/usr/local/lib/R/site-library")
+ library(ComplexHeatmap, lib.loc = "/usr/local/lib/R/site-library")
+ library(CATALYST, lib.loc = "/usr/local/lib/R/site-library")
+ library(monocle3, lib.loc = "/usr/local/lib/R/site-library")
+ library(scran, lib.loc = "/usr/local/lib/R/site-library")
+ library(patchwork, lib.loc = "/usr/local/lib/R/site-library")
+ library(ggridges, lib.loc = "/usr/local/lib/R/site-library")
+ })
+
+env_checkpoint <- "temp_5_monocle.RData"
+
+#load object after manual annotation
+d <- readRDS("sce/d_adt_annot.rds")
+
+```
+
+```{r}
+## merge clusters with manual clustering
+mergetab <- read.csv("manual_annotation_131221.csv", header = TRUE, stringsAsFactors = FALSE)
+```
+
+
+```{r}
+metadata(altExp(d))$cluster_codes <- data.frame(
+  custom = factor(levels(altExp(d)$cluster_id)))
+
+metadata(altExp(d))$cluster_codes$merging_louvain <- factor(mergetab$new_cluster)
+```
+
+## MONOCLE 3 pseudotime analysis
+
+
+The analysis is mostly based on : https://cole-trapnell-lab.github.io/monocle3/docs/. 
+
+We restrict the pseudotime analysis to **cDCs population** and perform it on RNA data. 
+
+
+```{r}
+
+## rna
+rowData(d)$gene_short_name <- paste0(rowData(d)$symbol, ".", rowData(d)$ID)
+cdcs_cells <- which(colData(altExp(d))$cluster_id %in% 
+                      metadata(altExp(d))$cluster_codes$custom[grep("DC", metadata(altExp(d))$cluster_codes$merging_louvain)])
+cds <- new_cell_data_set(counts(d)[ ,cdcs_cells], cell_metadata = colData(d)[cdcs_cells, ], gene_metadata = rowData(d))
+colData(cds)$cluster_id <- colData(altExp(d))$cluster_id[cdcs_cells]
+colData(cds)$cluster_name <- plyr::mapvalues(colData(cds)$cluster_id, 
+                                       from = as.numeric(as.character(cluster_codes(altExp(d))$custom)), 
+                                       to = as.character(cluster_codes(altExp(d))$merging_louvain))
+colData(cds)$cluster_id <- droplevels(colData(cds)$cluster_id )
+colData(cds)$cluster_name <- droplevels(colData(cds)$cluster_name )
+colData(cds)$cluster_name <- factor(colData(cds)$cluster_name, 
+                                    levels = c("early_pre_DC", "pre_cDC2", "cDC1", "cDC2"))
+
+```
+
+<!-- ```{r} -->
+<!-- ## ADT -->
+<!-- altd <- altExp(d) -->
+<!-- rowData(altd)$gene_short_name <- rownames(rowData(altd)) -->
+<!-- cdcs_cells <- which(colData(altExp(d))$cluster_id %in%  -->
+<!--                       metadata(altExp(d))$cluster_codes$custom[grep("DC", metadata(altExp(d))$cluster_codes$merging_louvain)]) -->
+<!-- cds_adt <- new_cell_data_set(counts(altd)[ ,cdcs_cells], cell_metadata = colData(altd)[cdcs_cells, ], gene_metadata = rowData(altd)) -->
+<!-- colData(cds_adt)$cluster_name <- plyr::mapvalues(colData(cds_adt)$cluster_id,  -->
+<!--                                        from = as.numeric(as.character(cluster_codes(altExp(d))$custom)),  -->
+<!--                                        to = as.character(cluster_codes(altExp(d))$merging_louvain)) -->
+<!-- colData(cds_adt)$cluster_id <- droplevels(colData(cds_adt)$cluster_id ) -->
+<!-- colData(cds_adt)$cluster_name <- droplevels(colData(cds_adt)$cluster_name ) -->
+<!-- ``` -->
+
+
+`Monocle` pseudotime analysis requires separate preprocessing steps: 
+
+- normalization and dimension reduction
+
+- batch effect removal (using `batchelor`)
+
+- clustering
+
+i.e., **it will not use the preprocessing (normalization, clustering) that was done in our analysis and start again from the raw counts data.** 
+
+## Trajectory graph 
+
+Below, a UMAP plot of the data. It is different from the other UMAP plots of the analysis as we are using `Monocle`-specific functions. The groups of cells that we can observe is also not well overlapping with the cell labels as `Monocle` performed UMAP on the **RNA information**, while the cell labels were inferred from the **protein information**. 
+
+```{r, fig.width=9, fig.height=6}
+
+# very long step, loading the r environment if already computed 
+if(file.exists(env_checkpoint)){
+  load(env_checkpoint)
+} else {
+  # Select HVG to speed up MONOCLE process ()
+  batch <- d$Sample
+  dec.d_rna <- modelGeneVar(d, block = batch)
+  chosen.hvgs <- getTopHVGs(dec.d_rna, n=1000)
+  
+  ## Step 1: Normalize and pre-process the data
+  cds <- preprocess_cds(cds, num_dim = 100, 
+                        use_genes = chosen.hvgs)
+  ## Step 2: Remove batch effects with cell alignment
+  cds <- align_cds(cds, alignment_group = "Sample")
+  ## Step 3: Reduce the dimensions using UMAP
+  cds <- reduce_dimension(cds, cores = 10)
+}
+
+
+```
+
+Then, `Monocle` clusters the data and fit a principal graph on each partition of the data, which will be required for the pseudotime analysis:
+
+```{r, fig.width=9, fig.height=6}
+
+# long step, loading the precomputed r environement if already present 
+if(file.exists(env_checkpoint)){
+  load(env_checkpoint)
+} else {
+  ## Step 4: Cluster the cells
+  cds <- cluster_cells(cds, k = 50) # increased k to have lower resolution
+  
+  ## Step 5: Learn a graph
+  # use_partition = false to connect branches, if needed
+  cds <- learn_graph(cds) 
+}
+
+plot_cells(cds,
+           color_cells_by = "cluster_name",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE, label_principal_points = TRUE) 
+
+
+```
+
+
+`Monocle` can now order the cells in pseudotime. There is an option to select manually the "root" to use to compute the pseudotime but as the cell-types labels are too mixed in the RNA-UMAP space, I will use an automatic approach that learn the graph from the *early_pre_DC* cells. 
+
+The plot below shows the cells in pseudotime. Only cells that are connected (through the graph) to the *early_pre_DC* cells get a pseudotime scores. The cells in gray are too disconnected from the "root" cells (the *early_pre_DC*) to infer a pseudotime score. 
+
+
+```{r, fig.width=9, fig.height=6}
+## Step 6: Order cells
+# a helper function to identify the root principal points:
+get_earliest_principal_node <- function(cds, root="early_pre_DC"){
+  cell_ids <- which(colData(cds)[, "cluster_name"] == root)
+  
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+# For RNA, anchor points are Y_162 (previously identified when all clusters were connected), 
+# Y_23 (point with several early_preDC) and Y_84 (same)
+cds <- order_cells(cds, root_pr_nodes=c("Y_205", "Y_23", "Y_84"))
+
+
+## plotting and showing pseudotime
+# grey cells: lack information to infer pseudotime
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5) 
+```
+
+Plotting the Monocle UMAP, colored by cDC type and pseudotime next to each other for better comparison: 
+
+```{r, fig.width=8, fig.height=4}
+plot_cells(cds,
+           color_cells_by = "cluster_name",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE) + 
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5) 
+```
+
+Plotting the Monocle UMAP for cDC cells, highlitghting the sample of origin and condition. This is used to check if condition or sample drives the clusters that we observe on the UMAP: 
+
+```{r, fig.width=9, fig.height=6}
+# plot_cells(cds[ ,sample(1:ncol(cds), ncol(cds))],
+#            color_cells_by = "Sample",
+#            label_cell_groups = FALSE,
+#            label_groups_by_cluster=FALSE,
+#            label_leaves=FALSE,
+#            label_branch_points=FALSE, 
+#            alpha = 0.5) + 
+plot_cells(cds[ ,sample(1:ncol(cds), ncol(cds))],
+           color_cells_by = "condition",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5, 
+           alpha = 0.5) 
+```
+
+```{r, fig.width=8, fig.height=6}
+
+plts <- lapply(unique(colData(cds)$condition), function(x){
+  
+  plot_cells(cds[, colData(cds)$condition == x],
+           color_cells_by = "condition",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE, 
+           alpha = 0.5) 
+  
+})
+patchwork::wrap_plots(plts)
+```
+
+
+```{r, include=FALSE, eval=FALSE}
+## 3D plots, not relevant ATM
+# cds_3d <- reduce_dimension(cds, max_components = 3)
+# cds_3d <- cluster_cells(cds_3d, k = 50)
+# cds_3d <- learn_graph(cds_3d, use_partition = FALSE)
+# cds_3d <- order_cells(cds_3d, root_pr_nodes=get_earliest_principal_node(cds_3d, "early_pre_DC"))
+# colData(cds_3d)$cluster_name <- as.character(colData(cds_3d)$cluster_name)
+# cds_3d_plot_obj <- plot_cells_3d(cds_3d, color_cells_by="cluster_name",)
+# cds_3d_plot_obj
+```
+
+## Population density 
+
+Density of cell-type populations along the pseudotime. The populations in the early pseudotime correspond to the *anchors* that were used to define the graph and should correspond to the early cell populations. 
+
+```{r, fig.width=8, fig.height=8}
+
+
+psuper <- function(cds, var_plot){
+  proj_dt <- data.frame("psuper" = cds@principal_graph_aux[["UMAP"]]$pseudotime,
+                        "label_input" = colData(cds)[, var_plot])
+  # proj_test <- proj_dt#[-which(proj_dt$psuper == Inf),]
+  # new_max <- max(proj_test$psuper) + 2*sd(proj_test$psuper)
+  # proj_dt[which(proj_dt$psuper == Inf),"psuper"] <- new_max
+  # proj_dt[which(proj_dt$psuper == Inf),"psuper"] <- new_max
+  # plot
+    ggplot(proj_dt) +
+        aes( x=psuper, y=label_input, label_input, fill=label_input, colour=label_input ) +
+        geom_density_ridges( alpha=0.5 ) +
+        # scale_fill_manual( values=col_group ) +
+        #geom_vline( data=cuts_dt, aes(xintercept=psuper, colour=label_input) ) +
+        # scale_colour_manual( values=col_group ) +
+        guides(
+            fill    = guide_legend(override.aes = list(alpha=1), reverse = TRUE)
+            ,colour = FALSE
+            ) +
+        labs(
+            x       = 'Pseudotime'
+            ,y      = 'Density'
+            ,fill   = 'cluster_name'
+            ) +
+        theme_bw()
+}
+psuper(cds, "cluster_name") 
+
+```
+
+Population density **per condition** in RNA pseudotime: 
+
+```{r, fig.height=6, fig.width=8}
+plts <- lapply(unique(colData(cds)$condition), function(x){
+  whichsub <- colData(cds)$condition == x
+  cds_sub <- cds[,whichsub]
+  cds_sub@principal_graph_aux[["UMAP"]]$pseudotime <- cds_sub@principal_graph_aux[["UMAP"]]$pseudotime[whichsub]
+  psuper(cds_sub, "cluster_name") + ggtitle(x)
+})
+patchwork::wrap_plots(plts)
+
+```
+<!-- Population density per condition in **ADT** pseudotime  -->
+
+<!-- ```{r, fig.height=6, fig.width=8} -->
+<!-- plts <- lapply(unique(colData(cds_adt)$condition), function(x){ -->
+<!--   whichsub <- colData(cds_adt)$condition == x -->
+<!--   cds_sub <- cds_adt[,whichsub] -->
+<!--   cds_sub@principal_graph_aux[["UMAP"]]$pseudotime <- cds_sub@principal_graph_aux[["UMAP"]]$pseudotime[whichsub] -->
+<!--   psuper(cds_sub, "cluster_name") + ggtitle(x) -->
+<!-- }) -->
+<!-- patchwork::wrap_plots(plts) -->
+
+<!-- ``` -->
+
+But are the density of pseudotime different between the treatments and the control group ? We can test this with the two-sample Komogorov-Smirnov test, which tests the null hypothesis that the distribution of pseudotime for each cluster are drawn from the same distribution. 
+
+```{r}
+# none condition
+cls <- levels(unique(colData(cds)$cluster_name))
+whichsub <- colData(cds)$condition == "none"
+cds_sub_none <- cds[,whichsub]
+cds_sub_none@principal_graph_aux[["UMAP"]]$pseudotime <- cds_sub_none@principal_graph_aux[["UMAP"]]$pseudotime[whichsub]
+pseudo_dt <- lapply(cls, function(y){
+  data.frame("psuper" = cds_sub_none@principal_graph_aux[["UMAP"]]$pseudotime,
+                        "label_input" = y)
+})
+pseudo_dt_none <- do.call("rbind", pseudo_dt)
+
+kstst <- lapply(c("S1P", "LPS", "LPS_S1P"), function(x){
+  
+  # cds sub for each dondition
+  whichsub <- colData(cds)$condition == x
+  cds_sub <- cds[,whichsub]
+  cds_sub@principal_graph_aux[["UMAP"]]$pseudotime <- cds_sub@principal_graph_aux[["UMAP"]]$pseudotime[whichsub]
+  
+  # preparing pseudotime in df
+  pseudo_dt <- lapply(cls, function(y){
+  data.frame("psuper" = cds_sub@principal_graph_aux[["UMAP"]]$pseudotime,
+                          "label_input" = y)
+  })
+  pseudo_dt <- do.call("rbind", pseudo_dt)
+  
+  tsts <- lapply(cls, function(y){
+    kstest <- ks.test(pseudo_dt$psuper[pseudo_dt$label_input == y], 
+                      pseudo_dt_none$psuper[pseudo_dt_none$label_input == y])
+    kstest$p.value
+  })
+  names(tsts) <- cls
+  tsts <- unlist(tsts)
+  tsts
+})
+names(kstst) <- c("S1P vs none", "LPS vs none", "LPS_S1P vs none")
+kstst
+
+```
+
+
+## Chemokines & cytokines expression
+
+Genes of interest are chemokynes and cytokines genes (CCL, CXCL). Let's plot their expression on the Monocle RNA UMAP: 
+
+```{r}
+# rownames(d) <- rowData(cds)$gene_short_name
+# ccl_cxcl_il <- unique(grep("CCL|CXCL|IL-", rownames(d), value = TRUE))
+# ccl_cxcl_il <- ccl_cxcl_il[1:min(length(ccl_cxcl_il), 9)]
+rn <- rowData(cds)$symbol
+rn[is.na(rn)] <- rowData(cds)$ID[is.na(rn)]
+rn <- make.unique(rn)
+rownames(cds) <- rn
+# 
+# plot_cells(cds,
+#            genes=ccl_cxcl_il,
+#            label_cell_groups=FALSE,
+#            show_trajectory_graph=FALSE)
+```
+
+**CCL projected on MONOCLE plots**, in RNA UMAP space 
+
+
+```{r, fig.height=7, fig.width=10}
+ccl <- unique(grep("CCL", rownames(cds), value = TRUE))
+plot_cells(cds,
+           genes=ccl,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+Plotting the most interesting gene expression in function of pseudotime and population density: 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% c("CCL20", "CCL26", "CCL22", "CCL17", "CCL2", "CCL13", "CCL5", "CCL18", "CCL3", "CCL4", "CCL3L1", "CCL4L2" ), ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+**CXCL genes projected on MONOCLE plots**, in RNA UMAP space 
+
+
+```{r, fig.height=7, fig.width=10}
+cxcl <- unique(grep("CXCL", rownames(cds), value = TRUE))
+plot_cells(cds,
+           genes=cxcl,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+Plotting the most interesting gene expression in function of pseudotime and population density: 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% c("CXCL8", "CXCL1", "CXCL3", "CXCL2", "CXCL9", "CXCL10", "CXCL11"), ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+
+
+
+
+
+## CCL-high cluster
+
+One cluster showed interesting high expressino of several chemokynes, although it is a mix of several cell-types. 
+
+Let's isolate it with a coarse clustering: 
+
+```{r}
+cds = cluster_cells(cds, resolution=1e-5)
+plot_cells(cds)
+```
+The cluster of interest is the cluster n°3 here
+
+```{r}
+cds3 <- cds[, clusters(cds) == 3]
+d3 <- d[,colnames(d) %in% colnames(cds3)]
+d3$condition <- factor(d3$condition, levels = c("none", "LPS", "S1P", "LPS_S1P"))
+altExp(d3)$condition <- factor(altExp(d3)$condition, levels = c("none", "LPS", "S1P", "LPS_S1P"))
+
+```
+
+```{r, fig.height=6, fig.width=8}
+plotAbundances(altExp(d3), k = "merging_louvain", by = "sample_id", 
+               group_by = "condition") +xlab("sample")
+```
+```{r, fig.height=6, fig.width=8}
+plotAbundances(altExp(d3), k = "merging_louvain", by = "cluster_id")
+```
+
+### Comparison with other cDCs
+
+Let's compare cluster 3 with other cDCs clusters from Monocle: 
+
+```{r, fig.height=6, fig.width=8}
+dsub <- d[,colnames(d) %in% colnames(cds)]
+dsub$is.cluster3 <- ifelse(colnames(dsub) %in% colnames(d3), TRUE, FALSE)
+altExp(dsub)$is.cluster3 <- ifelse(colnames(altExp(dsub)) %in% colnames(d3), TRUE, FALSE)
+
+plotAbundances(altExp(dsub), k = "merging_louvain", by = "cluster_id", group_by = "is.cluster3")
+
+```
+
+```{r, fig.height=6, fig.width=8}
+plotAbundances(altExp(dsub), k = "merging_louvain", by = "sample_id", 
+               group_by = "is.cluster3") +xlab("cluster3 cDCs")
+```
+
+
+Find the markers of cluster 3, compared to other cDCs;
+
+```{r}
+# find markers
+dsub <- dsub[!is.na(rowData(dsub)$symbol),]
+rownames(dsub) <- rowData(dsub)$symbol
+markers <- scran::findMarkers(dsub,
+                              pval.type = "all",
+                              direction = "up",
+                              groups = dsub$is.cluster3, 
+                              block = dsub$Sample)
+celltypes <- names(markers)
+samecols <- sapply(celltypes, function(u){
+    subdf <- data.frame(markers[[u]][,c("p.value","FDR","summary.logFC")])
+    
+    #choose markers below cutoff
+    subdf <- subdf[subdf$FDR < 0.05,]
+    
+    #only export tables with something
+    if(nrow(subdf) > 0) {
+    # dir.create("reports/TABLES", showWarnings = FALSE)
+    # write.csv(subdf, 
+    #           file = sprintf("reports/TABLES/DE_genes_against_%s_%s.csv",
+    #                          testf, u))
+    }
+  })
+mark_per_clus <- lapply(markers, function(u){
+    genes <- rownames(u[u$FDR < 0.05,])
+    if(length(genes) > 0) {
+    if(length(genes) >= 10) genes[1:10] else genes
+    }
+  })
+names(mark_per_clus) <- c("cDCs", "cluster3.cDCs")
+mark_per_clus
+```
+
+
+```{r, fig.height=6, fig.width=8}
+umarks <- unique(unlist(mark_per_clus))
+
+#think about removing clusters with MT-makers
+#for now remove the MT markers, robosomal markers and some known markers that have high expression
+umarks <- umarks[!grepl("MT-",umarks)]
+umarks <- umarks[!grepl("\\.RP[SL]",umarks)]
+umarks <- umarks[!grepl("EEF1A1|TMSB4X|MALAT1|ACTB|FTL|B2M",umarks)]
+
+#set to plot RNA heatmap
+dsubsub <- dsub[umarks, ]
+colData(dsubsub) <- colData(dsubsub)[,c("Sample", "sample_id", "patient_id", "condition", "is.cluster3")]
+#add custom metadata
+metadata(dsubsub) <- metadata(altExp(dsub))
+colData(dsubsub)$cluster_id <- altExp(dsubsub)$cluster_id
+
+plotExprHeatmap(dsubsub, by = "cluster_id", k = "custom", m = "merging_louvain",
+                scale = "first", row_clust = FALSE, assay = "logcounts")
+```
+
+
+```{r, fig.height=6, fig.width=8}
+#df for rowannotation
+dfrow <- data.frame(cluster_id = rep(names(mark_per_clus), 
+                                     lengths(mark_per_clus)))
+#subset to only clusters with some DE genes
+cellstouse <- names(mark_per_clus)[!sapply(mark_per_clus, is.null)]
+dsubsub <- dsub#[,dsub$is.cluster3 %in% cellstouse]
+dsubsub$is.cluster3 <- factor(as.character(
+  ifelse(dsubsub$is.cluster3 == TRUE, "cluster3.cDCs", "cDCs")
+))
+#png("test.png", width = 1000, height = 1500)
+# pdf(sprintf("reports/HEATMAPS/heatmap_markers_long_%s.pdf", testf ), width = 11, height = 14)
+source("scripts/plotExprHeatmapLarge.R")
+set.seed(111000)
+library(RColorBrewer)
+library(circlize)
+plotExprHeatmapFull(dsubsub, features = umarks, 
+                    drow = dfrow, #add celltypes for gene markers
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "is.cluster3",
+                    col_clust = FALSE,
+                    row_clust = FALSE,
+                    assay = "logcounts",
+                    cells = 10000,
+                    k = "is.cluster3",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = dsubsub$is.cluster3)
+```
+
+
+
+```{r}
+saveRDS(cds, "sce/monocle_rna.rds")
+
+```
+
+
+
+```{r}
+sessionInfo()
+```
+

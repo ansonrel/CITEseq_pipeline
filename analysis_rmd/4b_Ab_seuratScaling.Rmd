@@ -1,0 +1,219 @@
+---
+title: "Use seurat scaling on ADT"
+author: "Stephany Orjuela & Anthony Sonrel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+    highlight: tango
+    code_folding: show
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
+execute <- FALSE
+```
+
+## Load packages
+
+
+```{r}
+suppressPackageStartupMessages({
+ library(ggplot2)
+ library(SingleCellExperiment)
+ library(Seurat)
+ library(sctransform)
+ library(scater)
+ })
+```
+
+## Import, convert
+```{r}
+d <- readRDS("sce/d_rna_filt.rds")
+
+altExp(d)
+d.seurat <- as.Seurat(d)
+
+d.seurat[["ADT"]] <- CreateAssayObject(counts = counts(altExp(d)))
+
+```
+
+
+## Normalize, scale
+
+Setting center to TRUE will center the expression for each feautre by subtracting the average expression for that feature.
+Setting scale to TRUE will scale the expression level for each feautre by dividing the centered feature expression levels by 
+their standard deviations if center is TRUE and by their root mean square otherwise.
+```{r}
+d.seurat <- NormalizeData(d.seurat, verbose = FALSE, normalization.method = "CLR", 
+                          assay = "ADT",
+                          margin = 2)
+d.seurat <- ScaleData(d.seurat, 
+                      #features = rownames(d.seurat@assays$ADT@data), 
+                      assay = "ADT", verbose = FALSE,
+                      do.scale = TRUE,
+                      do.center = TRUE,
+                      split.by = "Sample"
+                      )
+
+adt.data <- GetAssayData(d.seurat, slot = "scale.data", assay = "ADT")
+
+idx <- match(colnames(adt.data),colnames(d))
+rownames(adt.data) <- rownames(altExp(d))
+assay(altExp(d), "seurat.scale") <- adt.data[,idx]
+```
+
+add that to a SCE for easier viz
+```{r, fig.width = 10, fig.height= 10}
+library(CATALYST)
+
+#add marker types
+rowData(altExp(d))$marker_class <- "type"
+rowData(altExp(d))$marker_class[grepl("IgG", rownames(altExp(d)))] <- "none"
+colData(altExp(d)) <- colData(d)[,c("sample_id", "seurat", "Sample", "patient_id", "condition","total", "batch.discard",
+  grep("altexps_", colnames(colData(d)), value = TRUE))]
+
+rowData(altExp(d))$marker_name <- rowData(altExp(d))$ID
+
+#turn coldata into factors
+colData(altExp(d))$sample_id <- factor(colData(altExp(d))$sample_id)
+colData(altExp(d))$patient_id <- factor(colData(altExp(d))$patient_id)
+colData(altExp(d))$condition <- factor(colData(altExp(d))$condition)
+colData(altExp(d))$Sample <- factor(colData(altExp(d))$Sample)
+
+#run UMAP
+set.seed(1010010)
+altExp(d) <- runDR(altExp(d), cells = 2000, features = "type", assay = "seurat.scale")
+
+#UMAP dimension reduction showing cells per sample ID
+plotDR(altExp(d), color_by="sample_id", assay = "seurat.scale")
+
+#UMAP dimension reduction showing cells per well
+plotDR(altExp(d), color_by="Sample", assay = "seurat.scale")
+
+
+#look at all markers
+#Heatmap of median scaled expression of the ADT markers
+plotExprHeatmap(altExp(d), features = "type", assay = "seurat.scale",
+                bars = TRUE, row_clust = TRUE, scale = "never")
+
+#Expression of scaled markers in UMAP plot
+plotDR(altExp(d), color_by = type_markers(altExp(d)), assay = "seurat.scale")
+
+assay(altExp(d), "exprs") <- as.matrix(assay(altExp(d), "seurat.scale"))
+#Smoothed density of seurat-scaled markers expression per well
+plotExprs(altExp(d), color_by = "Sample") + coord_cartesian(xlim =c(-5,5))
+
+# CD45 vs total UMI
+total_expr <- colSums(assay(altExp(d), "counts"))
+num_features <- colSums(assay(altExp(d), "counts") > 0)
+df <- data.frame(total_expr = total_expr,
+                 num_features = num_features,
+                 #ccr5_clr = assay(altExp(d), "seurat.scale")["CCR5",],
+                 ccr5_clr = assay(altExp(d), "seurat.scale")["CD45",],
+                 sample_id = colData(altExp(d))$sample_id,
+                 Sample = colData(altExp(d))$Sample)
+#CD45 scaled expression vs total UMI, colored per well
+ggplot(df, aes(log10(total_expr), ccr5_clr, colour=Sample)) +
+  geom_point() + xlim(2,4) + facet_wrap(~Sample, nrow=2) +
+  geom_density2d(colour="white") +
+  geom_vline(aes(xintercept = 2.75, colour="black")) +
+  geom_hline(aes(yintercept = 0, colour="black"))
+
+
+cd45 <- t(assay(altExp(d), "seurat.scale"))[,"CD45"]
+others <- t(assay(altExp(d), "seurat.scale"))
+others <- others[,-which(colnames(others) == "CD45")]
+nam <- rep(colnames(others), each = nrow(others))
+others <- as.numeric(others)
+df <- data.frame(CD45 = rep(cd45, length(unique(nam))), 
+                 markers_expr = others, 
+                 markers = nam)
+# CD45 normalized expression vs other markers
+ggplot(df, aes(markers_expr, CD45)) +
+  xlim(min(cd45), max(cd45)) + 
+  ylim(min(others), max(others)) + 
+  facet_wrap(~markers, nrow=6) +
+  geom_bin2d() + xlab("") +
+  scale_fill_continuous(type = "viridis")+
+  geom_vline(aes(xintercept = 0)) +
+  geom_hline(aes(yintercept = 0))
+
+
+
+```
+
+
+## Cluster on scaled counts
+
+We are performing here louvain clustering based on the seurat-scaled expression of the ADT markers.
+
+
+**The resulting clustering will be used in the downstream analysis (annotation, DS,..)**
+
+```{r}
+
+library(scran)
+set.seed(1010001)
+g.adt <- buildSNNGraph(altExp(d), d=NA, assay.type = "seurat.scale", k = 8, 
+                       subset.row = type_markers(altExp(d)), 
+                       BPPARAM = BiocParallel::MulticoreParam(5)) 
+
+clusters.adt <- igraph::cluster_louvain(g.adt)
+altExp(d)$cluster_id <- factor(clusters.adt$membership)
+altExp(d)$cluster_louvain <- factor(clusters.adt$membership)
+table(altExp(d)$cluster_louvain)
+```
+
+```{r, fig.width = 10, fig.height= 10}
+#change clust labels to plot
+source("scripts/getUMAPclusters.R")
+by_text <- getUMAPclusters(altExp(d)) 
+
+#UMAP dimension reduction colored by cluster
+plotDR(altExp(d), color_by="cluster_id", assay = "seurat.scale") + 
+  geom_point(alpha = 0.3, size = 0.5) +
+  annotate("text", x=by_text$x, y=by_text$y, label=names(by_text$x))
+
+metadata(altExp(d))$cluster_codes <- data.frame(
+  custom = factor(clusters.adt$membership), 
+  levels = clusters.adt$membership)
+
+#Abundance plot of clusters, separated by sample
+plotAbundances(altExp(d), k = "custom", by = "sample_id", 
+               group_by = "condition")
+
+#Expression heatmap of seurat-scaled markers, aggregated *without scaling*
+plotExprHeatmap(altExp(d), by = "cluster_id", assay = "seurat.scale",
+                k = "custom", features = "type", 
+                scale = "never", bars = TRUE, row_clust = FALSE)
+#Expression heatmap of seurat-scaled markers, *scaled, trimed and then aggregated per cluster*
+plotExprHeatmap(altExp(d), by = "cluster_id", assay = "seurat.scale",
+                k = "custom", features = "type", 
+                scale = "first", bars = FALSE, row_clust = FALSE)
+#Expression heatmap of seurat-scaled markers, *aggregated then scaled and trimmed per cluster*
+plotExprHeatmap(altExp(d), by = "cluster_id", assay = "seurat.scale",
+                k = "custom", features = "type", 
+                scale = "last", bars = FALSE, row_clust = FALSE)
+##save as heatmap_celltypes_scale
+
+```
+
+
+
+```{r}
+
+saveRDS(d, "sce/d_ADT_seuratscaled.rds")
+
+
+```
+
+
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,287 @@
+---
+title: "HTO debarcoding"
+author: "Stephany Orjuela & Anthony Sonrel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+    highlight: tango
+    code_folding: show
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
+```
+
+
+## Load packages
+
+```{r}
+suppressPackageStartupMessages({
+  library(fishpond)
+  library(tximport)
+  library(tximeta)
+  library(ggplot2)
+  library(CATALYST)
+  library(reshape2)
+  library(Seurat)
+  library(org.Hs.eg.db)
+  library(SingleCellExperiment)
+})
+
+
+
+```
+
+```{r, eval = FALSE, include = FALSE}
+# for testing: 
+fileName="W2"
+inputFolder=paste0("/home/Shared_s3it/asonrel/CITEseq/round9/alevin/HTO/",fileName,"/alevin/quants_mat.gz")
+sample_key <- read.table(sprintf("/home/asonrel/projects/krieg_REAPseq/Round9/metadata.csv"),
+                       header = TRUE,
+                       sep = ",",
+                       stringsAsFactors = FALSE)
+
+```
+
+## Read in all matrices matrix
+
+```{r}
+#alevin outputs
+hto.file <- inputFolder
+adt.file <- gsub("HTO","ADT",inputFolder)
+rna.file <- gsub("HTO","RNA",inputFolder)
+
+file.exists(hto.file, adt.file, rna.file)
+
+hto <- tximport(files = hto.file, type = "alevin")
+adt <- tximport(files = adt.file, type = "alevin")
+
+#load RNA with tximeta
+coldata <- data.frame(files = rna.file, names=fileName, stringsAsFactors=FALSE)
+rna <- tximeta(coldata, type = "alevin", skipSeqinfo = TRUE)
+
+#add gene names
+rna <- tximeta::addIds(rna, "SYMBOL", gene = TRUE)
+
+#Define common cells
+common.cells <- intersect(colnames(rna), colnames(adt$counts))
+common.cells <- intersect(common.cells , colnames(hto$counts))
+length(common.cells)
+
+#create SCE
+d <- SingleCellExperiment(list(counts=assay(rna, "counts")[, common.cells]))
+
+#add row information
+rowData(d)$chroms <- seqnames(rna)
+rowData(d)$symbol <- rowData(rna)$SYMBOL
+rowData(d)$ID <- rownames(rna)
+
+#add ADT and HTO counts
+altExp(d, "ADT") <- SingleCellExperiment(list(counts=adt$counts[, common.cells]))
+altExp(d, "HTO") <- SingleCellExperiment(list(counts=hto$counts[, common.cells]))
+```
+
+
+## Read in HTO design matrix
+
+```{r}
+sample_key <- read.table("/home/asonrel/projects/krieg_REAPseq/Round9/metadata.csv",
+                       header = TRUE,
+                       sep = ",",
+                       stringsAsFactors = FALSE)
+
+rownames(sample_key) <- sample_key$sample_id
+
+y <- as.matrix(sample_key[,grep("A0", colnames(sample_key))])
+well <- which(sample_key$well==as.integer(gsub("W","",fileName)))
+
+y <- y[well,]
+#colnames(y) <- gsub("A","",colnames(y))
+y <- y[,colSums(y)>0]
+y
+
+dhto <- altExp(d, "HTO")[rownames(altExp(d, "HTO")) %in% gsub("A0", "", colnames(y)),]
+```
+
+#Option 1
+
+## Test Seurat demux
+
+Not using Seurat demux for the moment as it is too sensible to low counts (see this [open issue](https://github.com/satijalab/seurat/issues/2549))
+
+```{r}
+pbmc.hashtag <- CreateSeuratObject(counts = counts(dhto))
+pbmc.hashtag <- pbmc.hashtag[,colSums(pbmc.hashtag) > 5]
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, normalization.method = "CLR", assay = "RNA")
+pbmc.hashtag <- HTODemux(pbmc.hashtag, positive.quantile = 0.99, assay = "RNA")
+
+table(pbmc.hashtag$RNA_classification)
+
+idx <- match(colnames(d), colnames(pbmc.hashtag))
+dhto$seurat[idx] <- pbmc.hashtag$RNA_classification
+
+for (u in 1:2) {
+  pairs <- paste0(colnames(y)[y[u,] == 1], collapse = "_")
+  dhto$seurat <- ifelse(dhto$seurat == pairs, rownames(y)[u], dhto$seurat)
+}
+
+dhto$seurat <- ifelse(dhto$seurat %in% rownames(y), dhto$seurat, 0)
+
+table(dhto$seurat)
+
+```
+
+#Option 2
+## Normalize
+```{r}
+hs1 <- as.matrix(counts(dhto))
+hs1_norm <- sweep(t(hs1), 1, colSums(hs1), FUN = "/")
+head(hs1_norm)
+#assay(d_hto, "exprs") <- t(hs1_norm)
+
+#Mark code
+# hs1_altnorm <- sweep(hs1_norm, 2, 
+#                      apply(hs1_norm, 2, quantile, probs = .99, na.rm = FALSE), FUN = "/")
+# hs1_altnorm[hs1_altnorm>1] <- 1
+# hs1_altnorm[hs1_altnorm<0] <- 0
+
+assay(dhto, "exprs") <- t(hs1_norm)
+# assay(d_hto, "exprs") <- t(hs1_altnorm)
+
+#add rowData
+rowData(dhto)$channel_name <- rowData(dhto)$marker_name <- rownames(dhto)
+rowData(dhto)$marker_class <- "none"
+rowData(dhto)$use_channel <- FALSE
+```
+
+## Assignment of preliminary IDs
+```{r}
+colnames(y) <- gsub("A","",colnames(y))
+dhto <- assignPrelim(dhto, y, assay = "exprs")
+
+table(dhto$bc_id)
+
+```
+
+## Compute barcode separation
+```{r}
+## compute barcode separation for ea. event
+deltas <- colData(dhto)$delta
+ggplot() + geom_histogram(aes(deltas), bins = 60)
+
+```
+
+## Compute cutoffs
+```{r}
+
+dhto <- estCutoffs(dhto)
+metadata(dhto)$sep_cutoffs
+
+# use population-specific cutoffs
+dhto <- applyCutoffs(dhto)
+table(dhto$bc_id)
+#    0    1    5 
+# 1506 5702 4801
+
+plotYields(dhto, which=0)
+#plotEvents(d_hto, n = 25)
+
+#include IDs in sce
+colData(d)$sample_id <- dhto$bc_id
+colData(d)$seurat <- dhto$seurat
+
+colData(dhto)$sample_id <- dhto$bc_id
+colData(altExp(d, "HTO"))$sample_id <- dhto$bc_id
+colData(altExp(d, "HTO"))$seurat <- dhto$seurat
+```
+
+# Plots
+
+```{r}
+library(scater)
+set.seed(1100101001)
+
+#remove rows with only NAs
+# vec <- colSums(is.na(hs1_norm)) > 0
+# d_hto <- d_hto[,!vec]
+# d_hto <- altExp(d, "HTO")
+```
+
+```{r, fig.width = 10, fig.height= 10}
+hash_prop <- as.data.frame(as.matrix(t(log10(assay(dhto, "counts")+1))))
+hash_prop$sample_id <- colData(dhto)$sample_id
+hash_prop$seurat <- as.character(colData(dhto)$seurat)
+
+head(hash_prop)
+
+custom_func <- function(data, mapping){
+  ggplot(data = data, mapping = mapping) +
+    geom_point(alpha = 0.3, size = 0.5) 
+}
+
+custom_dens <- function(data, mapping){
+  ggplot(data = data, mapping = mapping) +
+    geom_density(alpha = 0.3) 
+}
+```
+
+## Option 1
+```{r, fig.width = 10, fig.height= 10}
+GGally::ggpairs(hash_prop, columns = 1:4,
+                diag = list(continuous = custom_dens),
+                lower = list(continuous = custom_func),
+                ggplot2::aes(colour=seurat))
+# replacement for the moment
+# pairs(hash_prop[1:4], lower.panel = NULL,
+#       # diag.panel= list(continuous = custom_dens),
+#       panel = function(...) smoothScatter(..., nrpoints = 0, add = TRUE))
+```
+
+## Option 2
+```{r, fig.width = 10, fig.height= 10}
+GGally::ggpairs(hash_prop, columns = 1:4,
+                diag = list(continuous = custom_dens),
+                lower = list(continuous = custom_func),
+                ggplot2::aes(colour=sample_id))
+
+```
+
+
+## UMAPs
+```{r}
+rowData(dhto)$marker_class <- "type"
+dhto <- runDR(dhto, cells = 2000, assay = "exprs")
+plotDR(dhto, color_by="seurat")
+plotDR(dhto, color_by="sample_id")
+```
+
+##TSNE
+```{r}
+dhto <- runDR(dhto, cells = 2000, assay = "exprs", dr = "TSNE")
+plotDR(dhto, color_by="seurat", dr = "TSNE")
+plotDR(dhto, color_by="sample_id", dr = "TSNE")
+```
+
+## Save filtered sce for this sample
+
+```{r}
+
+d_filt <- d[,!colData(d)$sample_id==0]
+d_filt$Sample <- fileName
+
+d_filt
+
+colnames(d_filt) <- paste0(colnames(d_filt),"-",fileName)
+
+saveRDS(d_filt, file=sprintf("/home/asonrel/projects/krieg_REAPseq/Round9/sce/%s.rds", fileName)) 
+
+
+```
+
+```{r}
+sessionInfo()
+```

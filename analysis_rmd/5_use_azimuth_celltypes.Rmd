@@ -1,0 +1,253 @@
+---
+title: "Look at Expression markers in azimuth-defined celltypes"
+author: "Stephany Orjuela & Anthony Sonrel"
+date: "2021-02-17"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+    highlight: tango
+    code_folding: show
+    keep_md: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
+linage <- "M"
+torun = TRUE
+```
+
+## Load packages
+
+
+
+```{r}
+suppressPackageStartupMessages({
+ library(SingleCellExperiment)
+ library(scater)
+ library(purrr)  
+ library(data.table)
+ library(ComplexHeatmap)
+ library(CATALYST)
+ library(Seurat)
+ })
+
+linage
+```
+
+
+```{r, fig.width = 10, fig.height= 10}
+#load object after running azimuth online
+annots <- read.table(sprintf("sce/%s/azimuth_pred.tsv", linage), sep = '\t', header = TRUE)
+
+#load RNA-filtered SCE
+#d <- readRDS(sprintf("sce/%s/d_rna_filt.rds", linage))
+d <- readRDS(sprintf("sce/%s/d_adt_clust.rds", linage))
+#d <- d[, Cells(umap)]
+#reducedDim(d, "UMAP_azimuth") <- umap@cell.embeddings
+
+idx <- match(colnames(d), annots$cell)
+colData(d)$predicted.id <- annots$predicted.celltype.l2[idx]
+table(d$predicted.id)
+```
+
+
+```{r}
+#remove clusters with < 10 cells
+d <- d[,!d$predicted.id %in% names(which(table(d$predicted.id)< 10))]
+
+saveRDS(d, sprintf("sce/%s/d_adt_annot.rds", linage))
+```
+
+## Look at RNA UMAP with azimuth annotations
+
+```{r, fig.width = 10, fig.height= 10}
+source("scripts/getUMAPclusters.R")
+by_text <- getUMAPclusters(d, coldata = "predicted.id", meta = NULL) 
+plotDR(d, color_by = "predicted.id", assay = "logcounts", dr = "UMAP") +
+  geom_point(alpha = 0.3, size = 0.5) +
+  annotate("text", x=by_text$x, y=by_text$y, label=names(by_text$x), size = 3)
+```
+
+
+```{r, fig.width = 10, fig.height= 10}
+#azimuth projection
+by_text <- getUMAPclusters(d, coldata = "predicted.id", meta = NULL, dr = "UMAP") 
+plotDR(d, color_by = "predicted.id", assay = "logcounts", dr = "UMAP") +
+  geom_point(alpha = 0.3, size = 0.5) +
+  annotate("text", x=by_text$x, y=by_text$y, label=names(by_text$x), size = 3)
+```
+
+
+## Get RNA markers per celltype (DE analysis between celltypes)
+
+There are different ways to do this. Here we test two approaches. Whether the highly ranked genes are those that are DE between the current group and any other group ("any") or all other groups ("all"). 
+
+With `all` it's easier to visualize and more strict, because the null hypothesis is that the gene is not DE in all contrasts (1 cell type Vs each of the other). 
+
+With `any` it does not explicitly favour genes that are uniquely expressed in a cluster. Rather, it focuses on combinations of genes that - together - drive separation of a cluster from the others.
+
+*About the summary.logFC*:
+in `all`: is defined as the effect size from the pairwise comparison with the largest p-value. This reflects the fact that, with this approach, a gene is only as significant as its weakest DE.
+
+in `any`: is defined as the effect size from the pairwise comparison with the lowest p-value. The combined p-value is computed by applying Simes' method to all p-values.
+
+
+```{r}
+#what are the highest expressed genes overall
+#plotHighestExprs(d, colour_cells_by= "Sample")
+
+# find markers
+d <- d[!is.na(rowData(d)$symbol),]
+rownames(d) <- rowData(d)$symbol
+testf <- "all" #all
+markers <- scran::findMarkers(d,
+                              pval.type = testf,
+                              direction = "up",
+                              groups = d$predicted.id, 
+                              block = d$Sample)
+
+
+
+#organize tables to export in csv per celltype
+celltypes <- names(markers)
+dir.create(sprintf("reports/%s/TABLES/", linage))
+
+samecols <- sapply(celltypes, function(u){
+    subdf <- data.frame(markers[[u]][,c("p.value","FDR","summary.logFC")])
+    
+    #choose markers below cutoff
+    subdf <- subdf[subdf$FDR < 0.05,]
+    
+    #only export tables with something
+    if(nrow(subdf) > 0) {
+    write.csv(subdf, 
+              file = sprintf("reports/%s/TABLES/DE_genes_against_%s_%s.csv",
+                             linage,testf, u))
+    }
+  })
+
+#toexport <- dplyr::bind_rows(samecols, .id = "celltype")
+#write.csv(toexport, file = sprintf("DE_genes_against_%s_celltype.csv", testf))
+
+#get genes to plot
+mark_per_clus <- lapply(markers, function(u){
+    genes <- rownames(u[u$FDR < 0.05,])
+    if(length(genes) > 0) {
+    if(length(genes) >= 10) genes[1:10] else genes
+    }
+  })
+
+mark_per_clus
+```
+
+
+```
+
+```{r}
+umarks <- unique(unlist(mark_per_clus))
+```
+
+### Heatmaps
+
+```{r, fig.width = 10, fig.height= 10}
+#add metadata to sce
+metadata(d)$cluster_codes <- data.frame(
+  custom = factor(1:length(unique(d$predicted.id))),
+  azimuth = factor(unique(d$predicted.id)))
+
+idx <- match(d$predicted.id, metadata(d)$cluster_codes$azimuth)
+d$cluster_id <- metadata(d)$cluster_codes$custom[idx]
+
+#set to plot RNA heatmap
+dsub <- d[umarks, ]
+colData(dsub) <- colData(dsub)[,c("Sample", "sample_id", "patient_id", "condition", "cluster_id")]
+
+#sample heatmaps
+# plotExprHeatmap(dsub, assay = "logcounts", by = "sample_id",
+#                 bars = TRUE, row_clust = FALSE, scale = "last")
+
+#cluster heatmap
+plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "azimuth",
+                scale = "never", row_clust = FALSE, assay = "logcounts")
+```
+
+
+```{r, fig.width = 10, fig.height= 10}
+plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "azimuth",
+                scale = "first", row_clust = FALSE, assay = "logcounts")
+```
+
+
+Plot too big for RMD report (see `heatmaps` folder)
+
+```{r, eval = FALSE, echo  = FALSE}
+
+#df for rowannotation
+dfrow <- data.frame(cluster_id = rep(names(mark_per_clus), 
+                                     lengths(mark_per_clus)))
+
+#subset to only clusters with some DE genes
+cellstouse <- names(mark_per_clus)[!sapply(mark_per_clus, is.null)]
+dsub <- d[,d$predicted.id %in% cellstouse]
+
+suppressPackageStartupMessages({
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+})
+dir.create(sprintf("reports/%s/HEATMAPS",linage))
+#png("test.png", width = 1000, height = 1500)
+pdf(sprintf("reports/%s/HEATMAPS/heatmap_markers_long.pdf",linage), width = 11, height = 14)
+source("scripts/plotExprHeatmapLarge.R")
+set.seed(111000)
+plotExprHeatmapFull(dsub, features = umarks, 
+                    drow = dfrow, #add celltypes for gene markers
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "predicted.id",
+                    col_clust = FALSE,
+                    row_clust = FALSE,
+                    assay = "logcounts",
+                    cells = 100,
+                    k = "predicted.id",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = dsub$predicted.id)
+
+#on scaled ADTs
+altExp(d)$annot <- factor(cluster_ids(altExp(d), "merging_louvain"))
+
+plotExprHeatmapFull(altExp(d), features = type_markers(altExp(d)), 
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "annot",
+                    col_clust = FALSE,
+                    assay = "seurat.scale",
+                    cells = 100,
+                    k = "annot",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = altExp(d)$annot)
+
+#on non-scaled normalized ADTs
+clr_function <- function(x) {
+          return(log1p(x = x / (exp(x = sum(log1p(x = x[x > 0]), na.rm = TRUE) / length(x = x)))))
+}
+ab_norm <- apply(counts(altExp(d)), 2, clr_function)
+assay(altExp(d), "CLR") <- ab_norm
+plotExprHeatmapFull(altExp(d), features = type_markers(altExp(d)), 
+                    #annot_cols = c("cluster_ADT", "Sample"),
+                    annot_cols = "annot",
+                    col_clust = TRUE,
+                    assay = "CLR",
+                    cells = 100,
+                    k = "annot",
+                    row_dend = FALSE, col_dend = FALSE,
+                    split = altExp(d)$annot)
+```
+
+
+
+```{r}
+sessionInfo()
+```
+

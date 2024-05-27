@@ -1,0 +1,1644 @@
+---
+title: "DS analysis"
+author: "Stephany Orjuela & Anthony Sonrel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
+torun <- TRUE
+# TODO for compiling: 
+.libPaths(c("/usr/local/lib/R/site-library", "/usr/local/lib/R/library",
+            "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0"))
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+   library(tibble, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
+  library(magrittr, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
+  library(reshape2)
+  library(viridisLite, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
+  library(dplyr, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
+ library(SingleCellExperiment)
+ library(CATALYST)
+ library(muscat)
+ library(ggplot2)
+ library(purrr) 
+ library(msigdbr)
+ library(fgsea)
+ library(ggrepel)
+ library(gridExtra)
+ library(limma)
+ library(monocle3)
+ library(patchwork)
+library(viridis)
+})
+
+source("scripts/plotDiffHeatmapRows.R")
+
+#load object after manual annotation
+d <- readRDS("sce/d_adt_annot.rds")
+
+# load MONOCLE pseudotime for CDC
+cds <- readRDS("sce/monocle_rna.rds")
+cds_adt <- readRDS("sce/monocle_adt.rds")
+
+#save coldata because muscat somewhere downstream deletes the rest of columns
+coldata <- colData(d)
+meta <- metadata(d)
+reducedDim(d, "UMAP.ADT") <- reducedDim(altExp(d), "UMAP")
+altd <- altExp(d)
+
+mergetab <- read.csv("manual_annotation_131221.csv", header = TRUE, stringsAsFactors = FALSE)
+altd <- altExp(d)
+```
+
+## Setup
+
+Get right column names for muscat. 
+
+This is the object we are working with: 
+
+```{r}
+#to avoid duplicate gene names
+rownames(d) <- scater::uniquifyFeatureNames(ID=rownames(d), names =rowData(d)$symbol)
+
+#add group to sample_id
+d$sample_id <- paste0(d$sample_id,".",d$condition)
+
+d$cluster_id <- altd$cluster_id
+d$merged <- factor(cluster_ids(altd, "merging_louvain"))
+
+(d <- prepSCE(d, 
+    kid = "cluster_ADT", # subpopulation assignments
+    gid = "condition",  # group IDs (ctrl/stim)
+    sid = "sample_id",   # sample IDs (ctrl/stim.1234) 
+    drop = FALSE)) # drop all other colData columns
+```
+
+The following table shows the number of cells per sample and condition.
+Clusters with low counts will be automatically removed latter by the Muscat package.
+
+```{r}
+t(table(d$group_id, d$sample_id))
+```
+
+
+Muscat object, after aggregation:
+
+```{r}
+d$sample_id <- droplevels(d$sample_id)
+
+#aggregate to pseudobulk
+pb <- aggregateData(d,
+    assay = "counts", fun = "sum",
+    by = c("cluster_id", "sample_id"))
+pb
+
+```
+
+
+The object now has 1 assay per subpopulation
+```{r}
+# one assay per subpopulation
+assayNames(pb)
+```
+
+
+**MDS plot**: 
+
+shows the grouping of pseudobulks based on their cell-type and their condition. 
+
+Each dot is a sample-celltype pseudobulk. Pseudobulks from the same cell-type/ condition should normally group together. If pseudobulks from different conditions are separated on the plot, it could show that their genetic profile is different. 
+
+```{r}
+pbMDS(pb)
+```
+
+A contingency of cell-type per condition (such as shown below) is saved under: `TABLES/contingency_celltypes_condition.csv`
+
+```{r}
+write.csv(table(d$cluster_id, d$group_id), file = "reports/TABLES/contingency_celltypes_condition.csv")
+table(d$cluster_id, d$group_id)
+```
+
+
+## Sample-level analysis: Pseudobulk method {.tabset .tabset-fade}
+
+Each tab shows the analysis of one of the contrasts:
+
+### LPS vs none {.tabset .tabset-fade}
+
+#### DS test
+
+We are using edgeR method and accounting for patient-level effect. 
+
+```{r, message=FALSE, }
+file_denom <- "LPS_vs_none"
+conds <- c("LPS", "none")
+#paired design including batch
+ei <- colData(pb)
+ei$group_id <- factor(ei$group_id, levels = c("none", "LPS","LPS_S1P", "S1P"))
+# setting unstimulated as reference
+ei$group_id <- relevel(ei$group_id, "none")
+
+mod <- model.matrix(~ 0 + group_id + patient_id , data = ei)
+cont <- limma::makeContrasts("group_idLPS-group_idnone", levels = mod)
+mincells <- 10
+res <- pbDS(pb, design = mod, contrast = cont, 
+            min_cells = mincells, method = "edgeR", verbose = FALSE) #default
+
+```
+
+Below, the results of the DS analysis, per cluster. The tables shows the number of DS genes and their relative abundance in comparison to the total amount of genes. 
+
+```{r}
+#grab results
+tbl <- res$table[[1]]
+
+# filter FDR < 5%, abs(logFC) > 1 & sort by adj. p-value
+tbl_fil <- lapply(tbl, function(u) {
+  u <- dplyr::filter(u, p_adj.loc < 0.05, abs(logFC) > 1)
+  dplyr::arrange(u, p_adj.loc)
+})
+# nb. of DS genes & % of total by cluster
+n_de <- vapply(tbl_fil, nrow, numeric(1))
+p_de <- format(n_de / nrow(d) * 100, digits = 3)
+data.frame("#DS" = n_de, "%DS" = p_de, check.names = FALSE)
+
+```
+
+
+The full tables of results are saved under `TABLES/DSanalysis_*_filt.csv` and `reports/TABLES/DSanalysis_*_filt.csv` (filtered for significant results). 
+
+The table of results looks like this: 
+
+```{r}
+
+# Summarize results in single table 
+x <- resDS(d, res, bind = "row", cpm = TRUE)
+xfilt_lps <- x[x$p_adj.loc < 0.05,]
+xfilt_lps <- xfilt_lps[order(xfilt_lps$p_adj.loc),]
+
+write.csv(xfilt_lps, file = sprintf("reports/TABLES/DSanalysis_%s_filt.csv", file_denom))
+write.csv(x, file = sprintf("reports/TABLES/DSanalysis_%s.csv", file_denom))
+head(xfilt_lps)
+```
+
+Where the most important fields are: 
+
+- `gene`: gene name
+
+- `cluster_id`: cluster label
+
+- `logFC`: direction and strength of the differential expression for the current comparison. 
+
+- `p_adj.loc`: adjusted p-value 
+
+- `contrast`: a reminder of the comparison that was used for the test. 
+
+
+#### Visualize DS results
+
+**Heatmap of markers expression in both conditions. **
+
+Rownames show the gene names and the cluster in which the gene was identified as DS. 
+
+Columns are the samples for the two conditions.
+
+Right annotation columns show the log fold-change and the p-value associated with the DS test. 
+
+```{r, fig.width = 10, fig.height= 10}
+genes <- xfilt_lps$gene
+
+#add metadata, prepSCE removes it
+metadata(d)$cluster_codes <- cluster_codes(altd)
+
+#reset cluster ids
+# d$cluster_id <- d$cluster_id.1
+# d$merged <- factor(cluster_ids(d, "merging_louvain"))
+
+dsub <- d[genes,]
+assay(dsub, "logcounts") <- as.matrix(assay(dsub, "logcounts"))
+dsub$sample_id <- droplevels(dsub$sample_id)
+
+# remove unwanted groups from heatmap
+dsub <- dsub[,which(dsub$group_id %in% conds)]
+dsub$group_id <- factor(dsub$group_id)
+dsub$sample_id <- droplevels(dsub$sample_id)
+dsub$sample_id <- factor(dsub$sample_id, levels = levels(dsub$sample_id)[order(gsub(".*\\.", "", levels(dsub$sample_id)))])
+dsub$cluster_id <- dsub$cluster_id.1
+
+#showing markers expression for all condition 
+plotDiffHeatmap(dsub, xfilt_lps, k = "merging_louvain", top_n = 20,
+                        y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                        sort_by = "lfc", col_anno = c("group_id"),
+                        assay = "logcounts", fun = "mean")
+
+```
+
+**Heatmap of markers expression in both conditions,** focusing on cDC1 and cDC2: 
+
+```{r, fig.width = 10, fig.height= 10}
+
+cdc_id <- metadata(dsub)$cluster_codes$custom[metadata(dsub)$cluster_codes$merging_louvain %in% c("cDC1", "cDC2")]
+dsubsub <- dsub[, dsub$cluster_id %in% cdc_id]
+
+#showing markers expression for all condition and all BOR (except CTRL),
+# ordered by p-value and separated by cell-types
+custom_plotDiffHeatmap(dsubsub, xfilt_lps, k = "merging_louvain", top_n = 20,
+                y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                sort_by = "padj", col_anno = c("group_id"),
+                assay = "logcounts", fun = "mean", normalize = TRUE)
+```
+
+
+**Volcano plot** summarizing the statistics of the differential state analysis and displaying the top hits: 
+
+```{r}
+# Volcano plot
+res_df <- data.frame(marker_id =  x$gene, 
+                     significant = as.factor(x$gene %in% xfilt_lps$gene),
+                     n_clusters_found = 1,
+                     logFC = x$logFC, 
+                     min_log10.p_adj = -log10(x$p_adj.loc))
+
+res_df <- res_df[order(res_df$min_log10.p_adj, decreasing = TRUE), ]
+sign <- res_df$min_log10.p_adj > -log10(0.05)
+a <- sapply(1:nrow(res_df), function(x){
+  if (sign[x]) {
+    nrow(res_df[which(res_df$marker_id == res_df$marker_id[x] & sign), ])
+  } else 1
+  
+} )
+res_df$n_clusters_found = a
+
+# rm duplicates
+res_df <- res_df[!duplicated(res_df$marker_id), ]
+
+# feature names of top results only
+res_df$marker_id[rownames(res_df) %in% c(tail(rownames(res_df[res_df$logFC < 0, ]), -5),
+                   tail(rownames(res_df[res_df$logFC > 0, ]), -5))] <- NA
+
+max_x <- ceiling(max(abs(res_df$logFC)))
+max_y <- ceiling(max(res_df$min_log10.p_adj))
+
+ggplot(data=res_df, aes(x=logFC, y=min_log10.p_adj, color=significant)) +
+  geom_point(aes(size = n_clusters_found)) + 
+  xlim(c(-max_x, max_x)) + ylim(c(0, max_y)) +
+  xlab("log2 fold change") + ylab("-log10 p-value") +
+  geom_text_repel(aes(label=marker_id)) +
+  theme_gray()  
+```
+
+#### DS genes in MONOCLE pseudotime 
+
+**Cells projected on MONOCLE trajectory analysis**. 
+
+The following plot is a recap of what was done in the previous analysis report (`5_use_ADT_celltypes`). 
+
+```{r, fig.width=8, fig.height=5}
+plot_cells(cds,
+           color_cells_by = "cluster_name",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE) + 
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5) 
+```
+
+
+Next, top differentially expressed genes from cDCs  are projected on these MONOCLE plots (reminder: these plots were also constrained to DCs populations only). 
+
+
+```{r, fig.height=7, fig.width=10}
+sel_genes <- unique( xfilt_lps$gene[xfilt_lps$cluster_id %in% 
+                                         grep("DC", xfilt_lps$cluster_id, value = TRUE)])
+sel_genes <- sel_genes[1:min(length(sel_genes), 9)]
+xfilt_lps[xfilt_lps$gene %in% sel_genes, c("gene", "cluster_id", "logFC", "p_adj.loc")]
+rownames(cds) <- rownames(d)
+## make some names simpler: 
+
+plot_cells(cds,
+           genes=sel_genes,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+
+Top DS genes expression among pseudotime: 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% sel_genes, ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+
+
+The genes of interest are chemokynes and cytokines genes (CCL, CXCL, IL) and, if not present for this contrast, the most significant genes. 
+For readability, the plot is limited to 9 genes.
+
+**Genes of interest projected on MONOCLE plots**, in RNA UMAP space 
+
+```{r, fig.height=7, fig.width=10}
+ccl_cxcl_il <- unique(grep("CCL|CXCL|IL-", rownames(dsub), value = TRUE))
+ccl_cxcl_il <- ccl_cxcl_il[1:min(length(ccl_cxcl_il), 9)]
+rownames(cds) <- rownames(d)
+
+xfilt_lps[xfilt_lps$gene %in% ccl_cxcl_il, c("gene", "cluster_id", "logFC", "p_adj.loc")]
+
+plot_cells(cds,
+           genes=ccl_cxcl_il,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+
+The same genes among pseudotime. 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% ccl_cxcl_il, ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+
+#### DA analysis
+
+Differential abundance (DA) analysis compares the proportions of cell types across experimental conditions and aims to highlight populations that are present at different ratios.
+
+We can first render a boxplot where each panel compares the distribution of a given subpopulation’s frequencies between groups.
+
+As a reminder, we are correcting for patient-level effect so differences that might appear important on the plot might not be significant. 
+
+```{r, fig.width = 10, fig.height= 10}
+
+nk <- length(kids <- levels(d$merged))
+ns <- length(sids <- unique(d$sample_id)) 
+n_cells <- table(d$merged, d$sample_id)
+
+# calculate cluster proportions across samples
+freqs <- prop.table(n_cells, margin = 1)
+
+# prep. data.frame for plotting
+df <- data.frame(
+    frequency = as.numeric(freqs), 
+    cluster_id = rep(kids, ns),
+    Sample = rep(sids, each = nk))
+m <- match(df$Sample, rownames(ei))
+df$condition <- ei$group_id[m]
+df  <- df[df$condition %in% conds, ]
+# boxplot of relative cluster-abundances
+ggplot(df, aes(x = condition, y = frequency, color = condition)) +
+    geom_boxplot(outlier.colour = NA) +  geom_jitter() +
+    facet_wrap(~ cluster_id, scales = "free_y", ncol = 4) +
+    theme_classic()
+
+```
+
+Below, the result of the DA test, showing which cell-types have a change in abundance between the two conditions. 
+
+```{r}
+y <- edgeR::DGEList(counts = n_cells)
+y <- edgeR::estimateDisp(y, mod)
+fit <- edgeR::glmFit(y, mod)
+fit <- edgeR::glmLRT(fit, contrast = cont)
+fit$table <- fit$table[fit$table$PValue < 0.05, ]
+try(write.csv(fit$table, file = sprintf("reports/TABLES/DAanalysis_%s_filt.csv", file_denom)))
+try(round(edgeR::topTags(fit, n = Inf)$table, 3))
+```
+
+
+#### CAMERA gene set enrichmient
+
+We can now test our DEGs against gene sets pathways and highlight pathways that could be modified by the experiment. We are going to use `Limma`'s `CAMERA` tool. From their documentation: 
+
+"*Test whether a set of genes is highly ranked relative to other genes in terms of differential expression, accounting for inter-gene correlation.*"
+
+We are testing our DEGs against the following gene sets: 
+
+- hallmark gene sets (H1)
+
+- GO gene sets (C5)
+
+- oncogenic gene sets (C6)
+
+- immunologic gene sets (C7).
+
+
+The following table shows how many DEGs are in the selected MSigDB pathways database. 
+
+Clusters which have DEGs that have underrepresented are better to be left aside. 
+
+```{r}
+
+
+m_df <- lapply(c("H", "C5", "C6", "C7"), function(x) {
+  msigdbr(
+  species = "Homo sapiens",
+  category = x) %>%
+  mutate_at("gene_symbol", toupper)
+} )
+m_df <- do.call(rbind, m_df)
+
+
+restable <- res$table[[colnames(cont)]]
+  
+  
+restable <- lapply(restable, function(u) {
+  u$ensembl_id <- gsub("\\..*", "", u$gene)
+  u$symbol <- gsub("ENS.*?\\.", "", u$gene)
+  return(u)
+})
+
+# spot check: 
+# how many features are in the selected MSigDB pathways database
+sapply(restable, function(u) table(u$symbol %in% m_df$gene_symbol))
+```
+
+Number of sets that will be used for the enrichment analysis: 
+
+```{r}
+# filter for set sizes of 20-1000
+sets <- split(m_df$gene_symbol, m_df$gs_name)
+rm(m_df)
+n <- vapply(sets, length, numeric(1))
+sets <- sets[n >= 20 & n < 1000]
+
+# Number of sets that will be used for the enrichment analysis
+length(sets)
+```
+We can now run the analysis. The filtered results (FDR < 0.05) are saved under the  `table/CAMERA_GenesEnrichment_*_filts.csv` file. 
+
+```{r}
+# Run camera on ea. cluster
+kids <- names(restable)
+gs_dat <- lapply(kids, function(k) {
+    inds <- ids2indices(sets, restable[[k]]$symbol, remove.empty = TRUE)
+    dat <- assays(pb[restable[[k]]$gene, ])[[k]]
+    v <- voom(dat, mod)
+    f <- lmFit(v, mod)
+    f <- eBayes(f)
+    cf <- contrasts.fit(f, cont)
+    cf <- eBayes(cf)
+    list(indices = inds, voom = v, cluster_id = k, contrasts.fit = cf)  
+})
+names(gs_dat) <- kids
+
+# construct data.frame
+gs_df <- lapply(gs_dat, function(u)
+    camera(u$voom, u$indices, mod, cont) %>% 
+        rownames_to_column("geneset")) %>% 
+    bind_rows(.id = "cluster_id")
+map = setNames(names(restable), unique(gs_df$cluster_id))
+gs_df$cluster_id <- map[gs_df$cluster_id]
+gs_df_filt <- gs_df[gs_df$FDR < 0.05, ]
+gs_df_filt <- gs_df_filt[order(gs_df_filt$FDR), ]
+write.csv(gs_df_filt, file = sprintf("reports/TABLES/CAMERA_GenesEnrichment_%s_filts.csv", file_denom))
+gs_df_filt_lps <- gs_df_filt
+
+## reduce to top 5 pathways per cluster
+top10paths <- lapply(unique(gs_df$cluster_id), function(x){
+  gs_sub <- gs_df[which(gs_df$cluster_id == x), ]
+  gs_sub$geneset[1:min(nrow(gs_sub), 10)]
+}) 
+top10paths <- unlist(top10paths)
+gs_dfTops <-gs_df[gs_df$geneset %in% top10paths, ]
+  
+```
+
+We can then plot the top pathways. The following heatmap shows the top 10 pathways (according to FDR) per cluster, colored by level of significance and directionality (green for up-regulated pathways, red for down-regulated pathways). Some pathways were found in multiple clusters (rows with multiple hits) and grey squares indicate that no significant p-value was reached with a particular geneset in other clusters. The heatmap is colored by significance of the gene set analysis performed with `limma`'s `CAMERA` tool. The heatmap shows that the top pathways found for one cluster were also found for most other clusters.
+
+```{r, fig.width = 10, fig.height= 8}
+# pretty genesets names, tremove the GSE thing
+gs_dfTops$pretty_geneset <- gsub("GSE[0-9]*_", "", gs_dfTops$geneset)
+# -log10 FDR x direction of change and removes (NA) the non significant ones
+gs_dfTops$minlog10fdr_sign <- -log10(gs_dfTops$FDR) * ifelse(gs_dfTops$Direction == "Up", 1, -1)
+if(any(abs(gs_dfTops$minlog10fdr_sign) < -log10(0.05))){
+  gs_dfTops$minlog10fdr_sign[abs(gs_dfTops$minlog10fdr_sign) < -log10(0.05)] <- NA
+}
+
+# plot 
+ggplot(gs_dfTops, aes(cluster_id, pretty_geneset, fill = minlog10fdr_sign)) + 
+  geom_tile() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 01, hjust=1)) + 
+  scale_fill_gradient2(midpoint=0, low="red", mid="black", na.value = "grey",
+                     high="green", space ="Lab" , name = "-log10 FDR x direction")+
+  # scale_fill_viridis(option="magma",  na.value="grey", name = "-log10 FDR") + 
+  xlab("Cluster ID") + 
+  ylab("Geneset") 
+```
+
+```{r}
+
+top5paths <- (gs_df[order(gs_df$FDR), ])[1:5, ]
+top5paths$pretty_FDR <- formatC(top5paths$FDR, format = "e", digits = 2)
+
+for(i in 1:nrow(top5paths) ) {
+  cl <- top5paths$cluster_id[i]
+  tstat <- gs_dat[[cl]]$contrasts.fit$t[,colnames(cont)]
+  inds <- gs_dat[[cl]]$indices[[top5paths$geneset[i]]]
+
+  barcodeplot(tstat, index = inds, cex.main=.8,
+            quantiles=c(-1,1)*qt(.95, df=6),
+            main=paste0("Cluster: ", cl, 
+                        " -- ", top5paths$geneset[i], 
+                        "\nDirection: ", top5paths$Direction[i], " - FDR: ", top5paths$pretty_FDR[i] ))
+}
+```
+
+
+
+
+### S1P vs none {.tabset .tabset-fade}
+
+#### DS test
+
+We are using edgeR method and accounting for patient-level effect. 
+
+```{r, message=FALSE, }
+file_denom <- "S1P_vs_none"
+conds <- c("S1P", "none")
+#paired design including batch
+ei <- colData(pb)
+ei$group_id <- factor(ei$group_id, levels = c("none", "LPS","LPS_S1P", "S1P"))
+# setting unstimulated as reference
+ei$group_id <- relevel(ei$group_id, "none")
+
+mod <- model.matrix(~ 0 + group_id + patient_id , data = ei)
+cont <- limma::makeContrasts(sprintf("group_id%s-group_id%s", conds[1], conds[2]), levels = mod)
+mincells <- 10
+res <- pbDS(pb, design = mod, contrast = cont, 
+            min_cells = mincells, method = "edgeR", verbose = FALSE) #default
+
+```
+
+Below, the results of the DS analysis, per cluster. The tables shows the number of DS genes and their relative abundance in comparison to the total amount of genes. 
+
+```{r}
+#grab results
+tbl <- res$table[[1]]
+
+# filter FDR < 5%, abs(logFC) > 1 & sort by adj. p-value
+tbl_fil <- lapply(tbl, function(u) {
+  u <- dplyr::filter(u, p_adj.loc < 0.05, abs(logFC) > 1)
+  dplyr::arrange(u, p_adj.loc)
+})
+# nb. of DS genes & % of total by cluster
+n_de <- vapply(tbl_fil, nrow, numeric(1))
+p_de <- format(n_de / nrow(d) * 100, digits = 3)
+data.frame("#DS" = n_de, "%DS" = p_de, check.names = FALSE)
+
+```
+
+
+The full tables of results are saved under `TABLES/DSanalysis_*_filt.csv` and `reports/TABLES/DSanalysis_*_filt.csv` (filtered for significant results). 
+
+The table of results looks like this: 
+
+```{r}
+
+# Summarize results in single table 
+x <- resDS(d, res, bind = "row", cpm = TRUE)
+xfilt_s1p <- x[x$p_adj.loc < 0.05,]
+xfilt_s1p <- xfilt_s1p[order(xfilt_s1p$p_adj.loc),]
+
+write.csv(xfilt_s1p, file = sprintf("reports/TABLES/DSanalysis_%s_filt.csv", file_denom))
+write.csv(x, file = sprintf("reports/TABLES/DSanalysis_%s.csv", file_denom))
+head(xfilt_s1p)
+```
+
+Where the most important fields are: 
+
+- `gene`: gene name
+
+- `cluster_id`: cluster label
+
+- `logFC`: direction and strength of the differential expression for the current comparison. 
+
+- `p_adj.loc`: adjusted p-value 
+
+- `contrast`: a reminder of the comparison that was used for the test. 
+
+
+#### Visualize DS results
+
+Heatmap ofmarkers expression in both conditions. 
+
+Rownames show the gene names and the cluster in which the gene was identified as DS. 
+
+Columns are the samples for the two conditions.
+
+Right annotation columns show the log fold-change and the p-value associated with the DS test. 
+
+```{r, fig.width = 10, fig.height= 10}
+genes <- xfilt_s1p$gene
+
+#add metadata, prepSCE removes it
+metadata(d)$cluster_codes <- cluster_codes(altd)
+
+#reset cluster ids
+# d$cluster_id <- d$cluster_id.1
+# d$merged <- factor(cluster_ids(d, "merging_louvain"))
+
+
+dsub <- d[genes,]
+assay(dsub, "logcounts") <- as.matrix(assay(dsub, "logcounts"))
+dsub$sample_id <- droplevels(dsub$sample_id)
+
+# remove unwanted groups from heatmap
+dsub <- dsub[,which(dsub$group_id %in% conds)]
+dsub$group_id <- factor(dsub$group_id)
+dsub$sample_id <- droplevels(dsub$sample_id)
+dsub$sample_id <- factor(dsub$sample_id, levels = levels(dsub$sample_id)[order(gsub(".*\\.", "", levels(dsub$sample_id)))])
+dsub$cluster_id <- dsub$cluster_id.1
+
+#showing markers expression for all condition 
+plotDiffHeatmap(dsub, xfilt_s1p, k = "merging_louvain", top_n = 20,
+                        y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                        sort_by = "lfc", col_anno = c("group_id"),
+                        assay = "logcounts", fun = "mean")
+
+```
+Same as before, but focusing on cDC1 and cDC2: 
+
+```{r, fig.width = 10, fig.height= 10}
+
+cdc_id <- metadata(dsub)$cluster_codes$custom[metadata(dsub)$cluster_codes$merging_louvain %in% c("cDC1", "cDC2")]
+dsubsub <- dsub[, dsub$cluster_id %in% cdc_id]
+
+#showing markers expression for all condition and all BOR (except CTRL),
+# ordered by p-value and separated by cell-types
+custom_plotDiffHeatmap(dsubsub, xfilt_s1p, k = "merging_louvain", top_n = 20,
+                y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                sort_by = "padj", col_anno = c("group_id"),
+                assay = "logcounts", fun = "mean", normalize = TRUE)
+```
+
+
+Volcano plot summarizing the statistics of the differential state analysis and displaying the top hits: 
+
+```{r}
+# Volcano plot
+res_df <- data.frame(marker_id =  x$gene, 
+                     significant = as.factor(x$gene %in% xfilt_s1p$gene),
+                     n_clusters_found = 1,
+                     logFC = x$logFC, 
+                     min_log10.p_adj = -log10(x$p_adj.loc))
+
+res_df <- res_df[order(res_df$min_log10.p_adj, decreasing = TRUE), ]
+sign <- res_df$min_log10.p_adj > -log10(0.05)
+a <- sapply(1:nrow(res_df), function(x){
+  if (sign[x]) {
+    nrow(res_df[which(res_df$marker_id == res_df$marker_id[x] & sign), ])
+  } else 1
+  
+} )
+res_df$n_clusters_found = a
+
+# rm duplicates
+res_df <- res_df[!duplicated(res_df$marker_id), ]
+
+# feature names of top results only
+res_df$marker_id[rownames(res_df) %in% c(tail(rownames(res_df[res_df$logFC < 0, ]), -5),
+                   tail(rownames(res_df[res_df$logFC > 0, ]), -5))] <- NA
+
+max_x <- ceiling(max(abs(res_df$logFC)))
+max_y <- ceiling(max(res_df$min_log10.p_adj))
+
+ggplot(data=res_df, aes(x=logFC, y=min_log10.p_adj, color=significant)) +
+  geom_point(aes(size = n_clusters_found)) + 
+  xlim(c(-max_x, max_x)) + ylim(c(0, max_y)) +
+  xlab("log2 fold change") + ylab("-log10 p-value") +
+  geom_text_repel(aes(label=marker_id)) +
+  theme_gray()  
+
+```
+
+#### DS genes in MONOCLE pseudotime 
+
+**Cells projected on MONOCLE trajectory analysis**. 
+
+The following plot is a recap of what was done in the previous analysis report (`5_use_ADT_celltypes`). 
+
+```{r, fig.width=8, fig.height=5}
+plot_cells(cds,
+           color_cells_by = "cluster_name",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE) + 
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5) 
+```
+
+Next, top differentially expressed genes from cDCs  are projected on these MONOCLE plots (reminder: these plots were also constrained to DCs populations only). 
+
+
+```{r, fig.height=7, fig.width=10}
+sel_genes <- unique( xfilt_s1p$gene[xfilt_s1p$cluster_id %in% 
+                                         grep("DC", xfilt_s1p$cluster_id, value = TRUE)])
+sel_genes <- sel_genes[1:min(length(sel_genes), 9)]
+xfilt_s1p[xfilt_s1p$gene %in% sel_genes, c("gene", "cluster_id", "logFC", "p_adj.loc")]
+rownames(cds) <- rownames(d)
+## make some names simpler: 
+
+plot_cells(cds,
+           genes=sel_genes,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+
+Top DS genes expression among pseudotime: 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% sel_genes, ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+
+
+The genes of interest are chemokynes and cytokines genes (CCL, CXCL, IL) and, if not present for this contrast, the most significant genes. 
+For readability, the plot is limited to 9 genes.
+
+**Genes of interest projected on MONOCLE plots**, in RNA UMAP space 
+
+```{r, fig.height=7, fig.width=10}
+ccl_cxcl_il <- unique(grep("CCL|CXCL|IL-", rownames(dsub), value = TRUE))
+ccl_cxcl_il <- ccl_cxcl_il[1:min(length(ccl_cxcl_il), 9)]
+rownames(cds) <- rownames(d)
+
+xfilt_s1p[xfilt_s1p$gene %in% ccl_cxcl_il, c("gene", "cluster_id", "logFC", "p_adj.loc")]
+
+plot_cells(cds,
+           genes=ccl_cxcl_il,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+
+The same genes among pseudotime. 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% ccl_cxcl_il, ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+#### DA analysis
+
+Differential abundance (DA) analysis compares the proportions of cell types across experimental conditions and aims to highlight populations that are present at different ratios.
+
+We can first render a boxplot where each panel compares the distribution of a given subpopulation’s frequencies between groups.
+
+As a reminder, we are correcting for patient-level effect so differences that might appear important on the plot might not be significant. 
+
+```{r, fig.width = 10, fig.height= 10}
+
+nk <- length(kids <- levels(d$merged))
+ns <- length(sids <- unique(d$sample_id)) 
+n_cells <- table(d$merged, d$sample_id)
+
+# calculate cluster proportions across samples
+freqs <- prop.table(n_cells, margin = 1)
+
+# prep. data.frame for plotting
+df <- data.frame(
+    frequency = as.numeric(freqs), 
+    cluster_id = rep(kids, ns),
+    Sample = rep(sids, each = nk))
+m <- match(df$Sample, rownames(ei))
+df$condition <- ei$group_id[m]
+df  <- df[df$condition %in% conds, ]
+# boxplot of relative cluster-abundances
+ggplot(df, aes(x = condition, y = frequency, color = condition)) +
+    geom_boxplot(outlier.colour = NA) +  geom_jitter() +
+    facet_wrap(~ cluster_id, scales = "free_y", ncol = 4) +
+    theme_classic()
+
+```
+
+Below, the result of the DA test, showing which cell-types have a change in abundance between the two conditions. 
+
+```{r}
+y <- edgeR::DGEList(counts = n_cells)
+y <- edgeR::estimateDisp(y, mod)
+fit <- edgeR::glmFit(y, mod)
+fit <- edgeR::glmLRT(fit, contrast = cont)
+fit$table <- fit$table[fit$table$PValue < 0.05, ]
+try(write.csv(fit$table, file = sprintf("reports/TABLES/DAanalysis_%s_filt.csv", file_denom)))
+try(round(edgeR::topTags(fit, n = Inf)$table, 3))
+```
+
+
+#### CAMERA gene set enrichmient
+
+We can now test our DEGs against gene sets pathways and highlight pathways that could be modified by the experiment. We are going to use `Limma`'s `CAMERA` tool. From their documentation: 
+
+"*Test whether a set of genes is highly ranked relative to other genes in terms of differential expression, accounting for inter-gene correlation.*"
+
+We are testing our DEGs against the following gene sets: 
+
+- hallmark gene sets (H1)
+
+- GO gene sets (C5)
+
+- oncogenic gene sets (C6)
+
+- immunologic gene sets (C7).
+
+
+The following table shows how many DEGs are in the selected MSigDB pathways database. 
+
+Clusters which have DEGs that have underrepresented are better to be left aside. 
+
+```{r}
+
+
+m_df <- lapply(c("H", "C5", "C6", "C7"), function(x) {
+  msigdbr(
+  species = "Homo sapiens",
+  category = x) %>%
+  mutate_at("gene_symbol", toupper)
+} )
+m_df <- do.call(rbind, m_df)
+
+
+restable <- res$table[[colnames(cont)]]
+  
+  
+restable <- lapply(restable, function(u) {
+  u$ensembl_id <- gsub("\\..*", "", u$gene)
+  u$symbol <- gsub("ENS.*?\\.", "", u$gene)
+  return(u)
+})
+
+# spot check: 
+# how many features are in the selected MSigDB pathways database
+sapply(restable, function(u) table(u$symbol %in% m_df$gene_symbol))
+```
+
+Number of sets that will be used for the enrichment analysis: 
+
+```{r}
+# filter for set sizes of 20-1000
+sets <- split(m_df$gene_symbol, m_df$gs_name)
+rm(m_df)
+n <- vapply(sets, length, numeric(1))
+sets <- sets[n >= 20 & n < 1000]
+
+# Number of sets that will be used for the enrichment analysis
+length(sets)
+```
+We can now run the analysis. The filtered results (FDR < 0.05) are saved under the  `table/CAMERA_GenesEnrichment_*_filts.csv` file. 
+
+```{r}
+# Run camera on ea. cluster
+kids <- names(restable)
+gs_dat <- lapply(kids, function(k) {
+    inds <- ids2indices(sets, restable[[k]]$symbol, remove.empty = TRUE)
+    dat <- assays(pb[restable[[k]]$gene, ])[[k]]
+    v <- voom(dat, mod)
+    f <- lmFit(v, mod)
+    f <- eBayes(f)
+    cf <- contrasts.fit(f, cont)
+    cf <- eBayes(cf)
+    list(indices = inds, voom = v, cluster_id = k, contrasts.fit = cf)  
+})
+names(gs_dat) <- kids
+
+# construct data.frame
+gs_df <- lapply(gs_dat, function(u)
+    camera(u$voom, u$indices, mod, cont) %>% 
+        rownames_to_column("geneset")) %>% 
+    bind_rows(.id = "cluster_id")
+map = setNames(names(restable), unique(gs_df$cluster_id))
+gs_df$cluster_id <- map[gs_df$cluster_id]
+gs_df_filt <- gs_df[gs_df$FDR < 0.05, ]
+gs_df_filt <- gs_df_filt[order(gs_df_filt$FDR), ]
+write.csv(gs_df_filt, file = sprintf("reports/TABLES/CAMERA_GenesEnrichment_%s_filts.csv", file_denom))
+gs_df_filt_S1P <- gs_df_filt
+
+## reduce to top 5 pathways per cluster
+top10paths <- lapply(unique(gs_df$cluster_id), function(x){
+  gs_sub <- gs_df[which(gs_df$cluster_id == x), ]
+  gs_sub$geneset[1:min(nrow(gs_sub), 10)]
+}) 
+top10paths <- unlist(top10paths)
+gs_dfTops <-gs_df[gs_df$geneset %in% top10paths, ]
+  
+```
+
+We can then plot the top pathways. The following heatmap shows the top 10 pathways (according to FDR) per cluster, colored by level of significance and directionality (green for up-regulated pathways, red for down-regulated pathways). Some pathways were found in multiple clusters (rows with multiple hits) and grey squares indicate that no significant p-value was reached with a particular geneset in other clusters. The heatmap is colored by significance of the gene set analysis performed with `limma`'s `CAMERA` tool. The heatmap shows that the top pathways found for one cluster were also found for most other clusters.
+
+```{r, fig.width = 10, fig.height= 8}
+# pretty genesets names, tremove the GSE thing
+gs_dfTops$pretty_geneset <- gsub("GSE[0-9]*_", "", gs_dfTops$geneset)
+# -log10 FDR x direction of change and removes (NA) the non significant ones
+gs_dfTops$minlog10fdr_sign <- -log10(gs_dfTops$FDR) * ifelse(gs_dfTops$Direction == "Up", 1, -1)
+if(any(abs(gs_dfTops$minlog10fdr_sign) < -log10(0.05))){
+  gs_dfTops$minlog10fdr_sign[abs(gs_dfTops$minlog10fdr_sign) < -log10(0.05)] <- NA
+}
+
+# plot 
+ggplot(gs_dfTops, aes(cluster_id, pretty_geneset, fill = minlog10fdr_sign)) + 
+  geom_tile() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 01, hjust=1)) + 
+  scale_fill_gradient2(midpoint=0, low="red", mid="black", na.value = "grey",
+                     high="green", space ="Lab" , name = "-log10 FDR x direction")+
+  # scale_fill_viridis(option="magma",  na.value="grey", name = "-log10 FDR") + 
+  xlab("Cluster ID") + 
+  ylab("Geneset") 
+```
+
+```{r}
+
+top5paths <- (gs_df[order(gs_df$FDR), ])[1:5, ]
+top5paths$pretty_FDR <- formatC(top5paths$FDR, format = "e", digits = 2)
+
+for(i in 1:nrow(top5paths) ) {
+  cl <- top5paths$cluster_id[i]
+  tstat <- gs_dat[[cl]]$contrasts.fit$t[,colnames(cont)]
+  inds <- gs_dat[[cl]]$indices[[top5paths$geneset[i]]]
+
+  barcodeplot(tstat, index = inds, cex.main=.8,
+            quantiles=c(-1,1)*qt(.95, df=6),
+            main=paste0("Cluster: ", cl, 
+                        " -- ", top5paths$geneset[i], 
+                        "\nDirection: ", top5paths$Direction[i], " - FDR: ", top5paths$pretty_FDR[i] ))
+}
+```
+
+
+
+
+
+### LPS_S1P vs none {.tabset .tabset-fade}
+
+#### DS test
+
+We are using edgeR method and accounting for patient-level effect. 
+
+```{r, message=FALSE, }
+file_denom <- "LPS_S1P_vs_none"
+conds <- c("LPS_S1P", "none")
+#paired design including batch
+ei <- colData(pb)
+ei$group_id <- factor(ei$group_id, levels = c("none", "LPS","LPS_S1P", "S1P"))
+# setting unstimulated as reference
+ei$group_id <- relevel(ei$group_id, "none")
+
+mod <- model.matrix(~ 0 + group_id + patient_id , data = ei)
+cont <- limma::makeContrasts(sprintf("group_id%s-group_id%s", conds[1], conds[2]), levels = mod)
+mincells <- 10
+res <- pbDS(pb, design = mod, contrast = cont, 
+            min_cells = mincells, method = "edgeR", verbose = FALSE) #default
+
+```
+
+Below, the results of the DS analysis, per cluster. The tables shows the number of DS genes and their relative abundance in comparison to the total amount of genes. 
+
+```{r}
+#grab results
+tbl <- res$table[[1]]
+
+# filter FDR < 5%, abs(logFC) > 1 & sort by adj. p-value
+tbl_fil <- lapply(tbl, function(u) {
+  u <- dplyr::filter(u, p_adj.loc < 0.05, abs(logFC) > 1)
+  dplyr::arrange(u, p_adj.loc)
+})
+# nb. of DS genes & % of total by cluster
+n_de <- vapply(tbl_fil, nrow, numeric(1))
+p_de <- format(n_de / nrow(d) * 100, digits = 3)
+data.frame("#DS" = n_de, "%DS" = p_de, check.names = FALSE)
+
+```
+
+
+The full tables of results are saved under `TABLES/DSanalysis_*_filt.csv` and `reports/TABLES/DSanalysis_*_filt.csv` (filtered for significant results). 
+
+The table of results looks like this: 
+
+```{r}
+
+# Summarize results in single table 
+x <- resDS(d, res, bind = "row", cpm = TRUE)
+xfilt_s1p_lps <- x[x$p_adj.loc < 0.05,]
+xfilt_s1p_lps <- xfilt_s1p_lps[order(xfilt_s1p_lps$p_adj.loc),]
+
+write.csv(xfilt_s1p_lps, file = sprintf("reports/TABLES/DSanalysis_%s_filt.csv", file_denom))
+write.csv(x, file = sprintf("reports/TABLES/DSanalysis_%s.csv", file_denom))
+head(xfilt_s1p_lps)
+```
+
+Where the most important fields are: 
+
+- `gene`: gene name
+
+- `cluster_id`: cluster label
+
+- `logFC`: direction and strength of the differential expression for the current comparison. 
+
+- `p_adj.loc`: adjusted p-value 
+
+- `contrast`: a reminder of the comparison that was used for the test. 
+
+
+#### Visualize DS results
+
+Heatmap ofmarkers expression in both conditions. 
+
+Rownames show the gene names and the cluster in which the gene was identified as DS. 
+
+Columns are the samples for the two conditions.
+
+Right annotation columns show the log fold-change and the p-value associated with the DS test. 
+
+```{r, fig.width = 10, fig.height= 10}
+genes <- xfilt_s1p_lps$gene
+
+#add metadata, prepSCE removes it
+metadata(d)$cluster_codes <- cluster_codes(altd)
+
+#reset cluster ids
+# d$cluster_id <- d$cluster_id.1
+# d$merged <- factor(cluster_ids(d, "merging_louvain"))
+
+
+dsub <- d[genes,]
+assay(dsub, "logcounts") <- as.matrix(assay(dsub, "logcounts"))
+dsub$sample_id <- droplevels(dsub$sample_id)
+
+# remove unwanted groups from heatmap
+dsub <- dsub[,which(dsub$group_id %in% conds)]
+dsub$group_id <- factor(dsub$group_id)
+dsub$sample_id <- droplevels(dsub$sample_id)
+dsub$sample_id <- factor(dsub$sample_id, levels = levels(dsub$sample_id)[order(gsub(".*\\.", "", levels(dsub$sample_id)))])
+dsub$cluster_id <- dsub$cluster_id.1
+
+#showing markers expression for all condition 
+plotDiffHeatmap(dsub, xfilt_s1p_lps, k = "merging_louvain", top_n = 20,
+                        y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                        sort_by = "lfc", col_anno = c("group_id"),
+                        assay = "logcounts", fun = "mean")
+
+```
+Same as before, but focusing on cDC1 and cDC2: 
+
+```{r, fig.width = 10, fig.height= 10}
+
+cdc_id <- metadata(dsub)$cluster_codes$custom[metadata(dsub)$cluster_codes$merging_louvain %in% c("cDC1", "cDC2")]
+dsubsub <- dsub[, dsub$cluster_id %in% cdc_id]
+
+#showing markers expression for all condition and all BOR (except CTRL),
+# ordered by p-value and separated by cell-types
+custom_plotDiffHeatmap(dsubsub, xfilt_s1p_lps, k = "merging_louvain", top_n = 20,
+                y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                sort_by = "padj", col_anno = c("group_id"),
+                assay = "logcounts", fun = "mean", normalize = TRUE)
+```
+
+
+Volcano plot summarizing the statistics of the differential state analysis and displaying the top hits: 
+
+```{r}
+# Volcano plot
+res_df <- data.frame(marker_id =  x$gene, 
+                     significant = as.factor(x$gene %in% xfilt_s1p_lps$gene),
+                     n_clusters_found = 1,
+                     logFC = x$logFC, 
+                     min_log10.p_adj = -log10(x$p_adj.loc))
+
+res_df <- res_df[order(res_df$min_log10.p_adj, decreasing = TRUE), ]
+sign <- res_df$min_log10.p_adj > -log10(0.05)
+a <- sapply(1:nrow(res_df), function(x){
+  if (sign[x]) {
+    nrow(res_df[which(res_df$marker_id == res_df$marker_id[x] & sign), ])
+  } else 1
+  
+} )
+res_df$n_clusters_found = a
+
+# rm duplicates
+res_df <- res_df[!duplicated(res_df$marker_id), ]
+
+# feature names of top results only
+res_df$marker_id[rownames(res_df) %in% c(tail(rownames(res_df[res_df$logFC < 0, ]), -5),
+                   tail(rownames(res_df[res_df$logFC > 0, ]), -5))] <- NA
+
+max_x <- ceiling(max(abs(res_df$logFC)))
+max_y <- ceiling(max(res_df$min_log10.p_adj))
+
+ggplot(data=res_df, aes(x=logFC, y=min_log10.p_adj, color=significant)) +
+  geom_point(aes(size = n_clusters_found)) + 
+  xlim(c(-max_x, max_x)) + ylim(c(0, max_y)) +
+  xlab("log2 fold change") + ylab("-log10 p-value") +
+  geom_text_repel(aes(label=marker_id)) +
+  theme_gray()  
+```
+#### DS genes in MONOCLE pseudotime 
+
+**Cells projected on MONOCLE trajectory analysis**. 
+
+The following plot is a recap of what was done in the previous analysis report (`5_use_ADT_celltypes`). 
+
+```{r, fig.width=8, fig.height=5}
+plot_cells(cds,
+           color_cells_by = "cluster_name",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE) + 
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5) 
+```
+
+
+Next, top differentially expressed genes from cDCs  are projected on these MONOCLE plots (reminder: these plots were also constrained to DCs populations only). 
+
+
+```{r, fig.height=7, fig.width=10}
+sel_genes <- unique( xfilt_s1p_lps$gene[xfilt_s1p_lps$cluster_id %in% 
+                                         grep("DC", xfilt_s1p_lps$cluster_id, value = TRUE)])
+sel_genes <- sel_genes[1:min(length(sel_genes), 9)]
+xfilt_s1p_lps[xfilt_s1p_lps$gene %in% sel_genes, c("gene", "cluster_id", "logFC", "p_adj.loc")]
+rownames(cds) <- rownames(d)
+## make some names simpler: 
+
+plot_cells(cds,
+           genes=sel_genes,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+
+Top DS genes expression among pseudotime: 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% sel_genes, ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+
+
+The genes of interest are chemokynes and cytokines genes (CCL, CXCL, IL) and, if not present for this contrast, the most significant genes. 
+For readability, the plot is limited to 9 genes.
+
+**Genes of interest projected on MONOCLE plots**, in RNA UMAP space 
+
+```{r, fig.height=7, fig.width=10}
+ccl_cxcl_il <- unique(grep("CCL|CXCL|IL-", rownames(dsub), value = TRUE))
+ccl_cxcl_il <- ccl_cxcl_il[1:min(length(ccl_cxcl_il), 9)]
+rownames(cds) <- rownames(d)
+
+xfilt_s1p_lps[xfilt_s1p_lps$gene %in% ccl_cxcl_il, c("gene", "cluster_id", "logFC", "p_adj.loc")]
+
+plot_cells(cds,
+           genes=ccl_cxcl_il,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+
+The same genes among pseudotime. 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% ccl_cxcl_il, ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+#### DA analysis
+
+Differential abundance (DA) analysis compares the proportions of cell types across experimental conditions and aims to highlight populations that are present at different ratios.
+
+We can first render a boxplot where each panel compares the distribution of a given subpopulation’s frequencies between groups.
+
+As a reminder, we are correcting for patient-level effect so differences that might appear important on the plot might not be significant. 
+
+```{r, fig.width = 10, fig.height= 10}
+
+nk <- length(kids <- levels(d$merged))
+ns <- length(sids <- unique(d$sample_id)) 
+n_cells <- table(d$merged, d$sample_id)
+
+# calculate cluster proportions across samples
+freqs <- prop.table(n_cells, margin = 1)
+
+# prep. data.frame for plotting
+df <- data.frame(
+    frequency = as.numeric(freqs), 
+    cluster_id = rep(kids, ns),
+    Sample = rep(sids, each = nk))
+m <- match(df$Sample, rownames(ei))
+df$condition <- ei$group_id[m]
+df  <- df[df$condition %in% conds, ]
+# boxplot of relative cluster-abundances
+ggplot(df, aes(x = condition, y = frequency, color = condition)) +
+    geom_boxplot(outlier.colour = NA) +  geom_jitter() +
+    facet_wrap(~ cluster_id, scales = "free_y", ncol = 4) +
+    theme_classic()
+
+```
+
+Below, the result of the DA test, showing which cell-types have a change in abundance between the two conditions. 
+
+```{r}
+y <- edgeR::DGEList(counts = n_cells)
+y <- edgeR::estimateDisp(y, mod)
+fit <- edgeR::glmFit(y, mod)
+fit <- edgeR::glmLRT(fit, contrast = cont)
+fit$table <- fit$table[fit$table$PValue < 0.05, ]
+try(write.csv(fit$table, file = sprintf("reports/TABLES/DAanalysis_%s_filt.csv", file_denom)))
+try(round(edgeR::topTags(fit, n = Inf)$table, 3))
+```
+
+#### CAMERA gene set enrichmient
+
+We can now test our DEGs against gene sets pathways and highlight pathways that could be modified by the experiment. We are going to use `Limma`'s `CAMERA` tool. From their documentation: 
+
+"*Test whether a set of genes is highly ranked relative to other genes in terms of differential expression, accounting for inter-gene correlation.*"
+
+We are testing our DEGs against the following gene sets: 
+
+- hallmark gene sets (H1)
+
+- GO gene sets (C5)
+
+- oncogenic gene sets (C6)
+
+- immunologic gene sets (C7).
+
+
+The following table shows how many DEGs are in the selected MSigDB pathways database. 
+
+Clusters which have DEGs that have underrepresented are better to be left aside. 
+
+```{r}
+
+m_df <- lapply(c("H", "C5", "C6", "C7"), function(x) {
+  msigdbr(
+  species = "Homo sapiens",
+  category = x) %>%
+  mutate_at("gene_symbol", toupper)
+} )
+m_df <- do.call(rbind, m_df)
+
+
+restable <- res$table[[colnames(cont)]]
+  
+  
+restable <- lapply(restable, function(u) {
+  u$ensembl_id <- gsub("\\..*", "", u$gene)
+  u$symbol <- gsub("ENS.*?\\.", "", u$gene)
+  return(u)
+})
+
+# spot check: 
+# how many features are in the selected MSigDB pathways database
+sapply(restable, function(u) table(u$symbol %in% m_df$gene_symbol))
+```
+
+Number of sets that will be used for the enrichment analysis: 
+
+```{r}
+# filter for set sizes of 20-1000
+sets <- split(m_df$gene_symbol, m_df$gs_name)
+rm(m_df)
+n <- vapply(sets, length, numeric(1))
+sets <- sets[n >= 20 & n < 1000]
+
+# Number of sets that will be used for the enrichment analysis
+length(sets)
+```
+We can now run the analysis. The filtered results (FDR < 0.05) are saved under the  `table/CAMERA_GenesEnrichment_*_filts.csv` file. 
+
+```{r}
+# Run camera on ea. cluster
+kids <- names(restable)
+gs_dat <- lapply(kids, function(k) {
+    inds <- ids2indices(sets, restable[[k]]$symbol, remove.empty = TRUE)
+    dat <- assays(pb[restable[[k]]$gene, ])[[k]]
+    v <- voom(dat, mod)
+    f <- lmFit(v, mod)
+    f <- eBayes(f)
+    cf <- contrasts.fit(f, cont)
+    cf <- eBayes(cf)
+    list(indices = inds, voom = v, cluster_id = k, contrasts.fit = cf)  
+})
+names(gs_dat) <- kids
+
+# construct data.frame
+gs_df <- lapply(gs_dat, function(u)
+    camera(u$voom, u$indices, mod, cont) %>% 
+        rownames_to_column("geneset")) %>% 
+    bind_rows(.id = "cluster_id")
+map = setNames(names(restable), unique(gs_df$cluster_id))
+gs_df$cluster_id <- map[gs_df$cluster_id]
+gs_df_filt <- gs_df[gs_df$FDR < 0.05, ]
+gs_df_filt <- gs_df_filt[order(gs_df_filt$FDR), ]
+write.csv(gs_df_filt, file = sprintf("reports/TABLES/CAMERA_GenesEnrichment_%s_filts.csv", file_denom))
+
+
+## reduce to top 5 pathways per cluster
+top10paths <- lapply(unique(gs_df$cluster_id), function(x){
+  gs_sub <- gs_df[which(gs_df$cluster_id == x), ]
+  gs_sub$geneset[1:min(nrow(gs_sub), 10)]
+}) 
+top10paths <- unlist(top10paths)
+gs_dfTops <-gs_df[gs_df$geneset %in% top10paths, ]
+  
+```
+
+We can then plot the top pathways. The following heatmap shows the top 10 pathways (according to FDR) per cluster, colored by level of significance and directionality (green for up-regulated pathways, red for down-regulated pathways). Some pathways were found in multiple clusters (rows with multiple hits) and grey squares indicate that no significant p-value was reached with a particular geneset in other clusters. The heatmap is colored by significance of the gene set analysis performed with `limma`'s `CAMERA` tool. The heatmap shows that the top pathways found for one cluster were also found for most other clusters.
+
+```{r, fig.width = 10, fig.height= 8}
+# pretty genesets names, tremove the GSE thing
+gs_dfTops$pretty_geneset <- gsub("GSE[0-9]*_", "", gs_dfTops$geneset)
+# -log10 FDR x direction of change and removes (NA) the non significant ones
+gs_dfTops$minlog10fdr_sign <- -log10(gs_dfTops$FDR) * ifelse(gs_dfTops$Direction == "Up", 1, -1)
+if(any(abs(gs_dfTops$minlog10fdr_sign) < -log10(0.05))){
+  gs_dfTops$minlog10fdr_sign[abs(gs_dfTops$minlog10fdr_sign) < -log10(0.05)] <- NA
+}
+
+# plot 
+ggplot(gs_dfTops, aes(cluster_id, pretty_geneset, fill = minlog10fdr_sign)) + 
+  geom_tile() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 01, hjust=1)) + 
+  scale_fill_gradient2(midpoint=0, low="red", mid="black", na.value = "grey",
+                     high="green", space ="Lab" , name = "-log10 FDR x direction")+
+  # scale_fill_viridis(option="magma",  na.value="grey", name = "-log10 FDR") + 
+  xlab("Cluster ID") + 
+  ylab("Geneset") 
+```
+
+```{r}
+
+top5paths <- (gs_df[order(gs_df$FDR), ])[1:5, ]
+top5paths$pretty_FDR <- formatC(top5paths$FDR, format = "e", digits = 2)
+
+for(i in 1:nrow(top5paths) ) {
+  cl <- top5paths$cluster_id[i]
+  tstat <- gs_dat[[cl]]$contrasts.fit$t[,colnames(cont)]
+  inds <- gs_dat[[cl]]$indices[[top5paths$geneset[i]]]
+
+  barcodeplot(tstat, index = inds, cex.main=.8,
+            quantiles=c(-1,1)*qt(.95, df=6),
+            main=paste0("Cluster: ", cl, 
+                        " -- ", top5paths$geneset[i], 
+                        "\nDirection: ", top5paths$Direction[i], " - FDR: ", top5paths$pretty_FDR[i] ))
+}
+```
+
+
+## Summary
+
+### S1P + LPS specific DEGs
+<!-- temporary checkpoint in `temp_6_DS_analysis.RDATA` -->
+
+Number of differentially expressed genes per contrast, and the number of differentially expressed genes specific to the S1P+LPS combination. 
+
+```{r}
+genes <- unique(xfilt_s1p_lps$gene[-which(xfilt_s1p_lps$gene %in% c(xfilt_lps$gene, xfilt_s1p$gene))])
+xfilt_s1p_lps_specific <- xfilt_s1p_lps[xfilt_s1p_lps$gene %in% genes,]
+
+n <- c(length(unique(xfilt_lps$gene)), length(unique(xfilt_s1p$gene)), length(unique(xfilt_s1p_lps$gene)), 
+       length(unique(xfilt_s1p_lps_specific$gene)))
+names(n) <- c("LPS", "S1P", "LPS+S1P", "LPS+S1P specific")
+barplot(n, ylab = "# DEGs", xlab = "contrast")
+```
+For the LPS+S1P specific genes, see in which clusters they are expressed: 
+
+```{r, fig.height=4, fig.width=10}
+n <- lapply(unique(xfilt_s1p_lps_specific$cluster_id), function(x){
+  length(unique(xfilt_s1p_lps_specific$gene[xfilt_s1p_lps_specific$cluster_id == x]))
+})
+names(n) <- unique(xfilt_s1p_lps_specific$cluster_id)
+n <- unlist(n)
+n <- sort(n, decreasing = TRUE)
+barplot(n, ylab = "# DEGs", xlab = "cluster ID")
+
+```
+
+
+
+
+Let's zoom on the DEGs specific to the combinatorial treatments: 
+
+```{r, fig.width = 10, fig.height= 10}
+
+#add metadata, prepSCE removes it
+metadata(d)$cluster_codes <- cluster_codes(altd)
+
+#reset cluster ids
+# d$cluster_id <- d$cluster_id.1
+# d$merged <- factor(cluster_ids(d, "merging_louvain"))
+
+
+dsub <- d[genes,]
+assay(dsub, "logcounts") <- as.matrix(assay(dsub, "logcounts"))
+dsub$sample_id <- droplevels(dsub$sample_id)
+
+# remove unwanted groups from heatmap
+dsub <- dsub[,which(dsub$group_id %in% conds)]
+dsub$group_id <- factor(dsub$group_id)
+dsub$sample_id <- droplevels(dsub$sample_id)
+dsub$sample_id <- factor(dsub$sample_id, levels = levels(dsub$sample_id)[order(gsub(".*\\.", "", levels(dsub$sample_id)))])
+dsub$cluster_id <- dsub$cluster_id.1
+
+#showing markers expression for all condition 
+plotDiffHeatmap(dsub, xfilt_s1p_lps_specific, k = "merging_louvain", top_n = 20,
+                        y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                        sort_by = "lfc", col_anno = c("group_id"),
+                        assay = "logcounts", fun = "mean")
+```
+
+
+Same as before, but focusing on cDC1 and cDC2 populations:
+
+```{r, fig.width = 10, fig.height= 10}
+
+cdc_id <- metadata(dsub)$cluster_codes$custom[metadata(dsub)$cluster_codes$merging_louvain %in% c("cDC1", "cDC2")]
+dsubsub <- dsub[, dsub$cluster_id %in% cdc_id]
+
+#showing markers expression for all condition and all BOR (except CTRL),
+# ordered by p-value and separated by cell-types
+custom_plotDiffHeatmap(dsubsub, xfilt_s1p_lps_specific, k = "merging_louvain", top_n = 20,
+                y_cols = list(padj = "p_adj.loc", lfc = "logFC", target = "gene"),
+                sort_by = "padj", col_anno = c("group_id"),
+                assay = "logcounts", fun = "mean", normalize = TRUE)
+```
+                
+ 
+ 
+
+```{r, fig.height=7, fig.width=10}
+sel_genes <- unique( xfilt_s1p_lps_specific$gene[xfilt_s1p_lps_specific$cluster_id %in% 
+                                         grep("DC", xfilt_s1p_lps_specific$cluster_id, value = TRUE)])
+sel_genes <- sel_genes[1:min(length(sel_genes), 9)]
+xfilt_s1p_lps_specific[xfilt_s1p_lps_specific$gene %in% sel_genes, c("gene", "cluster_id", "logFC", "p_adj.loc")]
+rownames(cds) <- rownames(d)
+## make some names simpler: 
+
+plot_cells(cds,
+           genes=sel_genes,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+```
+
+
+Top DS genes expression among pseudotime: 
+
+```{r, fig.height=9, fig.width=6}
+cds_sub <- cds[rownames(cds) %in% sel_genes, ]
+
+#The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+plot_genes_in_pseudotime(cds_sub,
+                         color_cells_by="cluster_name",
+                         min_expr=0.5)
+```
+
+
+
+Gene enrichment analysis: 
+
+```{r, warning=FALSE}
+gmtfiles <- list.files("msigdb", full.names = TRUE)
+pathways <- lapply(gmtfiles, gmtPathways)
+pathways <- do.call(c, pathways)
+
+# fgsea needs pre-ranked genes. Let's order the significant genes by -log10.pval and weight by logFC
+# among responder
+ranks <- lapply(unique(xfilt_s1p_lps_specific$cluster_id), function(x){
+    xfilt_sub <- xfilt_s1p_lps_specific[xfilt_s1p_lps_specific$cluster_id == x, ]
+    ranks <- -log10(xfilt_sub$p_val) * sign(xfilt_sub$logFC)
+    names(ranks) <- xfilt_sub$gene
+    sort(ranks)
+
+})
+names(ranks) <- unique(xfilt_s1p_lps_specific$cluster_id)
+# remove lists with too few genes
+ranks <- ranks[lapply(ranks, length) > 5]
+
+fgseaRes <- lapply(names(ranks), function(x){
+    
+    fgseaRes <- fgsea(pathways, ranks[[x]], scoreType = "pos")
+    out <- fgseaRes
+    out$leadingEdge <- unlist(lapply(out$leadingEdge , function(x) paste(x, collapse = ",")))
+    out[order(pval), ]
+    })
+names(fgseaRes) <- names(ranks)
+ranks <- ranks[lapply(fgseaRes, nrow) > 0]
+fgseaRes <- fgseaRes[lapply(fgseaRes, nrow) > 0]
+fgseaRes <- lapply(names(fgseaRes), function(x){
+  fgseaRes[[x]]$cluster <- x
+  fgseaRes[[x]]
+})
+fgseaRes <- do.call(rbind, fgseaRes)
+fgseaRes <- fgseaRes[order(fgseaRes$padj), ]
+fgseaResFilt <- fgseaRes[fgseaRes$padj < 0.4, ]
+write.csv(fgseaResFilt, file = "reports/TABLES/GenesEnrichment_filt0.4_S1PLPS-specific.csv")
+
+## reduce to top 5 pathways per cluster
+top10paths <- lapply(unique(fgseaResFilt$cluster), function(x){
+  gs_sub <- fgseaResFilt[which(fgseaResFilt$cluster == x), ]
+  gs_sub$pathway[1:min(nrow(gs_sub), 10)]
+})
+top10paths <- unlist(top10paths)
+gs_dfTops <-fgseaRes[fgseaRes$pathway %in% top10paths, ]
+  
+
+```
+
+
+We can then plot the top pathways. The following heatmap shows the top 10 pathways (according to FDR) per cluster, colored by level of significance and directionality (green for up-regulated pathways, red for down-regulated pathways). Some pathways were found in multiple clusters (rows with multiple hits) and grey squares indicate that no significant p-value was reached with a particular geneset in other clusters. The heatmap is colored by significance of the gene set analysis performed with `limma`'s `CAMERA` tool. The heatmap shows that the top pathways found for one cluster were also found for most other clusters.
+
+
+
+```{r, fig.width = 14, fig.height= 8}
+# pretty genesets names, tremove the GSE thing
+gs_dfTops$pretty_geneset <- gsub("GSE[0-9]*_", "", gs_dfTops$pathway)
+# -log10 FDR x direction of change and removes (NA) the non significant ones
+gs_dfTops$minlog10fdr_sign <- -log10(gs_dfTops$padj) * ifelse(gs_dfTops$NES > 0, 1, -1)
+if(any(abs(gs_dfTops$minlog10fdr_sign) < -log10(0.4))){
+  gs_dfTops$minlog10fdr_sign[abs(gs_dfTops$minlog10fdr_sign) < -log10(0.4)] <- NA
+}
+# fill missing value that have been filtered out with 0
+nk <- length(unique(gs_dfTops$cluster))
+for(i in unique(gs_dfTops$pathway)){
+  gs_dfTops_sub <- gs_dfTops[gs_dfTops$pathway == i, ]
+  if(length(gs_dfTops_sub$cluster) == nk){
+    next()
+  } else {
+    k_abs <- unique(gs_dfTops$cluster[-which(gs_dfTops$cluster %in% unique(gs_dfTops_sub$cluster))])
+    for(j in k_abs){
+      gs_abs <- gs_dfTops_sub[1,,drop=FALSE]
+      gs_abs$minlog10fdr_sign <- NA
+      gs_abs$cluster <- j
+      gs_dfTops <- rbind(gs_dfTops, gs_abs)
+    }
+  }
+}
+
+# plot 
+ggplot(gs_dfTops, aes(cluster, pretty_geneset, fill = minlog10fdr_sign)) + 
+  geom_tile() + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 01, hjust=1)) + 
+  scale_fill_gradient2(midpoint=0, low="red", mid="black", na.value = "grey",
+                     high="green", space ="Lab" , name = "-log10 padj x direction")+
+  # scale_fill_viridis(option="magma",  na.value="grey", name = "-log10 FDR") + 
+  xlab("Cluster ID") + 
+  ylab("Geneset") 
+```
+
+                
+## Session info
+
+```{r}
+sessionInfo()
+```

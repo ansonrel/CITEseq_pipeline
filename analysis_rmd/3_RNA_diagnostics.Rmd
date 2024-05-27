@@ -1,0 +1,427 @@
+---
+title: "RNA diagnostics"
+author: "Stephany Orjuela & Anthony Sonrel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+    highlight: tango
+    code_folding: show
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
+execute = TRUE
+.libPaths(c(.libPaths(),"/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0", "/home/sorjuela/R/x86_64-pc-linux-gnu-library/4.0/"))
+do_seurat <- TRUE
+
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+ library(ggplot2)
+ library(SingleCellExperiment)
+ library(BiocParallel)
+ library(scDblFinder)
+ library(scran)
+ library(scater)
+ #library(celldex)
+ #library(SingleR)
+ })
+```
+
+
+```{r, eval = FALSE, include = FALSE}
+# should be >= 2.6.4
+package.version("beachmat")
+```
+
+
+## Read debarcoded sce
+
+These files have been filtered for cells that could not be assigned to a sample_id in the HTO debarcoding.
+
+```{r}
+
+folder <- list.files(path="sce", pattern = "^W[1-8].rds", full.names = TRUE)
+
+d <- readRDS(folder[1])
+for(i in 2:length(folder)){
+  x1 <- readRDS(folder[i])
+  d <- cbind(d, x1)
+}
+
+table(d$Sample)
+
+table(d$sample_id)
+
+```
+
+## Read metadata
+
+Remove ID samples that did not get any cells. 
+```{r}
+sample_key <- read.table("metadata.csv",
+                       header = TRUE,
+                       sep = ",",
+                       stringsAsFactors = FALSE)
+
+#Make colData match metadata in sce.
+sample_key <- sample_key[sample_key$sample_id %in% names(table(d$sample_id)),]
+head(sample_key)
+
+idx <- match(d$sample_id, sample_key$sample_id)
+d$patient_id <- sample_key$patient_id[idx]
+d$condition <- sample_key$condition[idx]
+
+```
+
+## Look at distributions before filtering
+
+```{r}
+rna_numi <- colSums(counts(d))
+adt_numi <- colSums(counts(altExp(d, "ADT")))
+hto_numi <- colSums(counts(altExp(d, "HTO")))
+
+nUMIdf <- data.frame(rna_nUMI = rna_numi,
+                 adt_nUMI = adt_numi,
+                 well = d$Sample,
+                 hto_nUMI = hto_numi)
+
+ggplot(nUMIdf, aes(x=log10(adt_nUMI+1), log10(rna_nUMI+1))) + 
+  geom_point(alpha = 0.1, size = 1) +
+  geom_density_2d(color = "orange")
+
+ggplot(nUMIdf, aes(x=log10(adt_nUMI+1), log10(rna_nUMI+1), color = well)) + 
+  geom_point(alpha = 0.1, size = 1) +
+  geom_density_2d(color = "orange")
+
+ggplot(nUMIdf, aes(x=log10(hto_nUMI+1), log10(rna_nUMI+1), color = well)) + 
+  geom_point(alpha = 0.1, size = 1) +
+  geom_density_2d(color = "orange")
+
+ggplot(nUMIdf, aes(x=log10(hto_nUMI+1), log10(adt_nUMI+1))) + 
+  geom_point(alpha = 0.1, size = 1) +
+  geom_density_2d(color = "orange")
+```
+
+## check empty droplets
+
+First, examine the distribution of total counts across barcodes, focusing on those with the largest counts.
+
+The knee and inflection points on the curve mark the transition between two components of the total count distribution. 
+This is assumed to represent the difference between empty droplets with little RNA and cell-containing droplets with much more RNA.
+
+```{r}
+#compute barcode ranks
+br.out <- DropletUtils::barcodeRanks(counts(d))
+# Making a plot.
+plot(br.out$rank, br.out$total, log="xy", xlab="Rank", ylab="Total")
+o <- order(br.out$rank)
+lines(br.out$rank[o], br.out$fitted[o], col="red")
+
+abline(h=metadata(br.out)$knee, col="dodgerblue", lty=2)
+abline(h=metadata(br.out)$inflection, col="forestgreen", lty=2)
+legend("bottomleft", lty=2, col=c("dodgerblue", "forestgreen"), 
+    legend=c("knee", "inflection"))
+```
+
+## Remove within-sample doublets
+
+```{r}
+
+batch <- d$Sample
+
+set.seed(101001)
+d <- scDblFinder(d, samples=batch) #, BPPARAM=MulticoreParam(4)) #multicore ruins the seed
+
+table(d$scDblFinder.class)
+```
+
+## Remove empty rows
+```{r}
+x <- rowSums(counts(d))
+table(x == 0)
+d <- d[x != 0,]
+```
+
+```{r}
+#plot score on PCA
+
+d <- logNormCounts(d)
+
+dec.d_rna <- modelGeneVar(d, block = batch)
+chosen.hvgs <- getTopHVGs(dec.d_rna, n=1000)
+
+set.seed(101001)
+d <- runPCA(d, subset_row=chosen.hvgs,
+    BPPARAM=MulticoreParam(4),
+    BSPARAM=BiocSingular::RandomParam())
+d <- runUMAP(d, BPPARAM=MulticoreParam(4))
+plotPCA(d[,sample(1:ncol(d), ncol(d))], colour_by="scDblFinder.score")
+plotUMAP(d[,sample(1:ncol(d), ncol(d))], colour_by="scDblFinder.score")
+
+d <- d[,d$scDblFinder.class == "singlet"]
+table(d$Sample)
+table(d$sample_id)
+```
+
+## QC
+
+### Low quality cells
+```{r}
+
+# Identifying the mitochondrial transcripts:
+is.mito <- which(rowData(d)$chroms == "chrM")
+length(is.mito)
+
+#Comput QC metrics
+df <- perCellQCMetrics(d, subsets=list(Mito=is.mito))
+
+## Quick version 
+#this is MADs 3 by default
+reasons <- quickPerCellQC(df, percent_subsets=c("subsets_Mito_percent"))
+colSums(as.matrix(reasons))
+```
+
+### by batches
+
+```{r}
+batch <- d$Sample
+batch.reasons <- quickPerCellQC(df, percent_subsets=c("subsets_Mito_percent"), 
+  batch=batch, nmads = 2.5)
+# use more stringent thresholds for wells 4,5,6, which have unusual bimodal distribution
+batch.reasons$low_lib_size2 <- isOutlier(df$sum, type = "lower", nmads = .8, batch = batch) & batch %in% c("W4", "W5", "W6")
+batch.reasons$low_n_features2 <- isOutlier(df$detected, type = "lower", nmads = .8, batch = batch) & batch %in% c("W4", "W5", "W6")
+batch.reasons$discard <- batch.reasons$discard | batch.reasons$low_lib_size2 | batch.reasons$low_n_features2
+# showing the number of cells that should be discarded, per criteria
+# discard = sum of all criteria 
+colSums(as.matrix(batch.reasons))
+```
+
+### Filter Ab counts 
+
+I filter them here because it is based on the `df` table
+
+```{r}
+#Require a minimum fold-change of 2 from the median (converted into log2).
+ab.discard <- isOutlier(df$altexps_ADT_detected,
+    log=TRUE, type="lower", min_diff=1, batch = batch)
+summary(ab.discard)
+
+hist(df$altexps_ADT_detected, col='grey', 
+    main="", xlab="Number of detected ADTs")
+abline(v=attr(ab.discard, "thresholds")["lower"], col="red", lty=2)
+```
+
+By comparison, the total ADT count is less useful as a QC metric because it is heavily correlated with the biological state of the cell. 
+The presence of a targeted protein can lead to a several-fold increase in the total ADT count given the binary nature of most surface protein markers. Removing cells with low total ADTs would strongly penalize cell types that do not exhibit many (or any) of the selected protein targets.
+
+### plot QC
+
+```{r, fig.width = 10, fig.height= 10}
+colData(d) <- cbind(colData(d), df)
+#d$discard <- reasons$discard
+d$batch.discard <- batch.reasons$discard | ab.discard
+
+# plot QC per sample
+gridExtra::grid.arrange(
+    plotColData(d, x="sample_id", y="sum", colour_by="batch.discard") +
+        scale_y_log10() + ggtitle("Total count"),
+    plotColData(d, x="sample_id", y="detected", colour_by="batch.discard") + 
+        scale_y_log10() + ggtitle("Detected features"),
+    plotColData(d, x="sample_id", y="subsets_Mito_percent", 
+        colour_by="batch.discard") + ggtitle("Mito percent"),
+    ncol=1
+)
+
+# plot QC per well (outliers were defined based on it)
+gridExtra::grid.arrange(
+    plotColData(d, x="Sample", y="sum", colour_by="batch.discard") +
+        scale_y_log10() + ggtitle("Total count"),
+    plotColData(d, x="Sample", y="detected", colour_by="batch.discard") + 
+        scale_y_log10() + ggtitle("Detected features"),
+    plotColData(d, x="Sample", y="subsets_Mito_percent", 
+        colour_by="batch.discard") + ggtitle("Mito percent"),
+    ncol=1
+)
+
+#confirm that there are no cells with both large total counts and large mitochondrial counts,
+#to ensure that we are not inadvertently removing high-quality cells that happen to be highly
+#metabolically active (e.g., hepatocytes)
+
+plotColData(d, x="sum", y="subsets_Mito_percent", 
+    colour_by="batch.discard", other_fields=c("Sample")) +
+    facet_wrap(~Sample) +
+    theme(panel.border = element_rect(color = "grey"))
+
+```
+
+
+### apply filter
+```{r, eval = execute}
+discard <- ab.discard | batch.reasons$discard 
+sum(discard)
+
+## plot RNA Vs ADT total counts
+
+rna_numi <- colSums(counts(d))
+adt_numi <- colSums(counts(altExp(d)))
+
+nUMIdf <- data.frame(rna_nUMI = rna_numi,
+                 adt_nUMI = adt_numi,
+                 discard_batch = batch.reasons$discard,
+                 adt_discard = ab.discard,
+                 mito_val = df$subsets_Mito_percent)
+
+ggplot(nUMIdf, aes(x=log10(adt_nUMI+1), log10(rna_nUMI+1), color = discard_batch)) + 
+  geom_point(alpha = 0.1, size = 1) +
+  geom_density_2d(color = "black")
+
+ggplot(nUMIdf, aes(x=log10(adt_nUMI+1), log10(rna_nUMI+1), color = adt_discard)) + 
+  geom_point(alpha = 0.1, size = 1) +
+  geom_density_2d(color = "black")
+
+
+#filter
+d_rna_filt <- d[,!discard]
+d_rna_filt
+
+table(colData(d_rna_filt)$Sample)
+table(colData(d_rna_filt)$sample_id)
+
+rna_numi <- colSums(counts(d_rna_filt))
+adt_numi <- colSums(counts(altExp(d_rna_filt)))
+
+nUMIdf <- data.frame(rna_nUMI = rna_numi,
+                 adt_nUMI = adt_numi,
+                 well = d_rna_filt$Sample)
+
+ggplot(nUMIdf, aes(x=log10(adt_nUMI+1), log10(rna_nUMI+1))) + 
+  geom_point(alpha = 0.5, size = 1) +
+  facet_wrap(~well) +
+  geom_density_2d(color = "orange") + 
+  theme_bw()
+
+```
+
+## Normalization
+
+Should not have to do by batch? maybe should be by batch??
+
+```{r, eval = execute}
+lib.sf <- librarySizeFactors(d_rna_filt)
+summary(lib.sf)
+hist(log10(lib.sf), xlab="Log10[Size factor]", col='grey80')
+
+lib.sf.batch <- data.frame(lib.sf, Well = colData(d_rna_filt)$Sample)
+ggplot(lib.sf.batch, aes(log10(lib.sf))) +  
+  geom_histogram() + facet_wrap(~Well, scales = "free")
+
+
+#Scaling and log-transforming
+d_rna_filt <- logNormCounts(d_rna_filt)
+assayNames(d_rna_filt)
+```
+
+## Variance modelling
+
+```{r, eval = execute}
+
+batch <- d_rna_filt$Sample
+
+dec.d_rna <- modelGeneVar(d_rna_filt, block = batch)
+dec.d_rna[order(dec.d_rna$bio, decreasing=TRUE),]
+
+par(mfrow=c(2,3))
+blocked.stats <- dec.d_rna$per.block
+for (i in colnames(blocked.stats)) {
+    current <- blocked.stats[[i]]
+    plot(current$mean, current$total, main=i, pch=16, cex=0.5,
+        xlab="Mean of log-expression", ylab="Variance of log-expression")
+    curfit <- metadata(current)
+    points(curfit$mean, curfit$var, col="red", pch=16)
+    curve(curfit$trend(x), col='dodgerblue', add=TRUE, lwd=2) 
+}
+
+#chosen.hvgs <- dec.d_rna$bio > 0
+chosen.hvgs <- getTopHVGs(dec.d_rna, n=2000)
+head(chosen.hvgs)
+```
+
+
+## Reduced dims
+```{r, eval = execute}
+#Run PCA on non-multi-normalized sce before
+set.seed(101001)
+d_rna_filt <- runPCA(d_rna_filt, subset_row=chosen.hvgs,
+    BPPARAM=MulticoreParam(4),
+    BSPARAM=BiocSingular::RandomParam())
+
+d_rna_filt <- runUMAP(d_rna_filt, dimred="PCA")
+d_rna_filt <- runTSNE(d_rna_filt, dimred="PCA")
+plotUMAP(d_rna_filt[,sample(1:ncol(d_rna_filt), ncol(d_rna_filt))], colour_by="Sample")
+plotUMAP(d_rna_filt[,sample(1:ncol(d_rna_filt), ncol(d_rna_filt))], colour_by="sample_id")
+
+saveRDS(d_rna_filt, "sce/d_rna_filt.rds")
+```
+
+## Clustering
+```{r, eval = execute}
+set.seed(101001)
+g <- buildSNNGraph(d_rna_filt, k=20, use.dimred='PCA', BPPARAM = MulticoreParam(4))
+clust <- igraph::cluster_louvain(g)$membership
+#clust <- igraph::cluster_walktrap(g)$membership
+d_rna_filt$cluster_id <- factor(clust)
+plotUMAP(d_rna_filt[,sample(1:ncol(d_rna_filt), ncol(d_rna_filt))], colour_by="cluster_id")
+```
+
+
+<!-- REMOVED BECAUSE ONLY GIVES DC -->
+<!-- ## Quick annotation -->
+<!-- ```{r, eval = execute, warnings = FALSE} -->
+<!-- hpca.se <- celldex::HumanPrimaryCellAtlasData() -->
+
+<!-- #filter genes without gene symbols -->
+<!-- dsub <- d_rna_filt[!is.na(rowData(d_rna_filt)$symbol),] -->
+
+<!-- #set symbols as rownames -->
+<!-- rownames(dsub) <- rowData(dsub)$symbol -->
+
+<!-- #run singleR -->
+<!-- pred.hesc <- SingleR(test = dsub,  -->
+<!--                      ref = hpca.se,  -->
+<!--                      labels = hpca.se$label.main,  -->
+<!--                      method = "cluster",  -->
+<!--                      clusters = clust -->
+<!--                      ) -->
+<!-- first.labels <- paste0(pred.hesc$first.labels,rownames(pred.hesc)) -->
+
+<!-- d_rna_filt$first.labels <- first.labels[match(d_rna_filt$cluster_id, rownames(pred.hesc))] -->
+
+
+<!-- CATALYST::plotDR(d_rna_filt, color_by="first.labels", assay = "logcounts", dr = "UMAP") +  -->
+<!--   geom_point(alpha = 0.3, size = 0.5) -->
+<!-- ``` -->
+
+Create Seurat object
+```{r, eval=do_seurat}
+
+d <- d[!is.na(rowData(d)$symbol),]
+rownames(d) <- rowData(d)$symbol
+
+library(Seurat)
+pbmc <- CreateSeuratObject(counts = counts(d))
+
+saveRDS(pbmc, "sce/seurat_d.rds")
+
+```
+
+
+```{r}
+sessionInfo()
+```
