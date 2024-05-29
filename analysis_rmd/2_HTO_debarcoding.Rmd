@@ -20,6 +20,7 @@ knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
 ## Load packages
 
 ```{r}
+
 suppressPackageStartupMessages({
   library(fishpond)
   library(tximport)
@@ -32,24 +33,24 @@ suppressPackageStartupMessages({
   library(SingleCellExperiment)
 })
 
-
-
 ```
 
 ```{r, eval = FALSE, include = FALSE}
 # for testing: 
-fileName="W2"
-inputFolder=paste0("/home/Shared_s3it/asonrel/CITEseq/round9/alevin/HTO/",fileName,"/alevin/quants_mat.gz")
-sample_key <- read.table(sprintf("/home/asonrel/projects/krieg_REAPseq/Round9/metadata.csv"),
-                       header = TRUE,
-                       sep = ",",
-                       stringsAsFactors = FALSE)
-
+fileName="W8"
+inputFolder=paste0("alevin/HTO/",fileName,"/alevin/quants_mat.gz")
+metadataFile="metadata/metadata.csv"
 ```
 
 ## Read in all matrices matrix
 
 ```{r}
+
+sample_key <- read.table(sprintf(metadataFile),
+                       header = TRUE,
+                       sep = ",",
+                       stringsAsFactors = FALSE)
+
 #alevin outputs
 hto.file <- inputFolder
 adt.file <- gsub("HTO","ADT",inputFolder)
@@ -89,10 +90,6 @@ altExp(d, "HTO") <- SingleCellExperiment(list(counts=hto$counts[, common.cells])
 ## Read in HTO design matrix
 
 ```{r}
-sample_key <- read.table("/home/asonrel/projects/krieg_REAPseq/Round9/metadata.csv",
-                       header = TRUE,
-                       sep = ",",
-                       stringsAsFactors = FALSE)
 
 rownames(sample_key) <- sample_key$sample_id
 
@@ -277,7 +274,7 @@ d_filt
 
 colnames(d_filt) <- paste0(colnames(d_filt),"-",fileName)
 
-saveRDS(d_filt, file=sprintf("/home/asonrel/projects/krieg_REAPseq/Round9/sce/%s.rds", fileName)) 
+saveRDS(d_filt, file=sprintf("sce/%s.rds", fileName)) 
 
 
 ```

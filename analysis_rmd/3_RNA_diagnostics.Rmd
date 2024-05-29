@@ -15,7 +15,6 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
 execute = TRUE
-.libPaths(c(.libPaths(),"/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0", "/home/sorjuela/R/x86_64-pc-linux-gnu-library/4.0/"))
 do_seurat <- TRUE
 
 ```
@@ -29,15 +28,18 @@ suppressPackageStartupMessages({
  library(scDblFinder)
  library(scran)
  library(scater)
- #library(celldex)
- #library(SingleR)
+ library(celldex)
+ library(SingleR)
  })
 ```
 
 
-```{r, eval = FALSE, include = FALSE}
-# should be >= 2.6.4
-package.version("beachmat")
+Parameters and paths : 
+
+```{r}
+metadataFile="metadata/metadata.csv"
+folder <- list.files(path="sce", pattern = "^W[1-8].rds", full.names = TRUE)
+
 ```
 
 
@@ -47,7 +49,6 @@ These files have been filtered for cells that could not be assigned to a sample_
 
 ```{r}
 
-folder <- list.files(path="sce", pattern = "^W[1-8].rds", full.names = TRUE)
 
 d <- readRDS(folder[1])
 for(i in 2:length(folder)){
@@ -65,7 +66,7 @@ table(d$sample_id)
 
 Remove ID samples that did not get any cells. 
 ```{r}
-sample_key <- read.table("metadata.csv",
+sample_key <- read.table(metadataFile,
                        header = TRUE,
                        sep = ",",
                        stringsAsFactors = FALSE)
@@ -381,32 +382,34 @@ plotUMAP(d_rna_filt[,sample(1:ncol(d_rna_filt), ncol(d_rna_filt))], colour_by="c
 ```
 
 
-<!-- REMOVED BECAUSE ONLY GIVES DC -->
-<!-- ## Quick annotation -->
-<!-- ```{r, eval = execute, warnings = FALSE} -->
-<!-- hpca.se <- celldex::HumanPrimaryCellAtlasData() -->
+## Quick annotation
 
-<!-- #filter genes without gene symbols -->
-<!-- dsub <- d_rna_filt[!is.na(rowData(d_rna_filt)$symbol),] -->
+Exploratory quick annotation using singleR to have a first insight about possible populations in the data. 
 
-<!-- #set symbols as rownames -->
-<!-- rownames(dsub) <- rowData(dsub)$symbol -->
+```{r, eval = execute, warnings = FALSE} 
+hpca.se <- celldex::HumanPrimaryCellAtlasData() 
 
-<!-- #run singleR -->
-<!-- pred.hesc <- SingleR(test = dsub,  -->
-<!--                      ref = hpca.se,  -->
-<!--                      labels = hpca.se$label.main,  -->
-<!--                      method = "cluster",  -->
-<!--                      clusters = clust -->
-<!--                      ) -->
-<!-- first.labels <- paste0(pred.hesc$first.labels,rownames(pred.hesc)) -->
+#filter genes without gene symbols 
+dsub <- d_rna_filt[!is.na(rowData(d_rna_filt)$symbol),] 
 
-<!-- d_rna_filt$first.labels <- first.labels[match(d_rna_filt$cluster_id, rownames(pred.hesc))] -->
+#set symbols as rownames 
+rownames(dsub) <- rowData(dsub)$symbol 
+
+#run singleR 
+pred.hesc <- SingleR(test = dsub,  
+                     ref = hpca.se,  
+                     labels = hpca.se$label.main,  
+                     method = "cluster",  
+                     clusters = clust 
+                     ) 
+first.labels <- paste0(pred.hesc$first.labels,rownames(pred.hesc)) 
+
+d_rna_filt$first.labels <- first.labels[match(d_rna_filt$cluster_id, rownames(pred.hesc))] 
 
 
-<!-- CATALYST::plotDR(d_rna_filt, color_by="first.labels", assay = "logcounts", dr = "UMAP") +  -->
-<!--   geom_point(alpha = 0.3, size = 0.5) -->
-<!-- ``` -->
+CATALYST::plotDR(d_rna_filt, color_by="first.labels", assay = "logcounts", dr = "UMAP") +  
+  geom_point(alpha = 0.3, size = 0.5) 
+``` 
 
 Create Seurat object
 ```{r, eval=do_seurat}

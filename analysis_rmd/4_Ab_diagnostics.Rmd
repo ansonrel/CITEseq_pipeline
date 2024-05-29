@@ -29,6 +29,9 @@ suppressPackageStartupMessages({
  })
 ```
 
+```{r}
+inputFile <- "sce/d_rna_filt.rds" 
+```
 
 ## Read debarcoded and filtered sce (after running 1, 2 and 3 steps)
 
@@ -41,7 +44,7 @@ These files have been filtered for:
 * ADT MAD5 per batch.
 
 ```{r}
-d <- readRDS("sce/d_rna_filt.rds")
+d <- readRDS(inputFile)
 
 d
 altExp(d)

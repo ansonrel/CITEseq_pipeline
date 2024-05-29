@@ -1,0 +1,331 @@
+---
+title: "Monocle3 pseudotime analysis"
+author: "Anthony Sonrel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"), warning=FALSE)
+```
+
+
+```{r, warning=FALSE}
+suppressPackageStartupMessages({
+ library(SingleCellExperiment)
+ library(scater)
+ library(purrr)  
+ library(data.table)
+ library(ComplexHeatmap)
+ library(CATALYST)
+ library(monocle3)
+ library(scran)
+ library(patchwork)
+ library(ggridges)
+ })
+
+
+#load object after manual annotation
+d <- readRDS("sce/d_adt_annot.rds")
+
+```
+
+```{r}
+## merge clusters with manual clustering
+mergetab <- read.csv("metadata/annotation.csv", header = TRUE, stringsAsFactors = FALSE)
+```
+
+
+```{r}
+metadata(altExp(d))$cluster_codes <- data.frame(
+  custom = factor(levels(altExp(d)$cluster_id)))
+
+metadata(altExp(d))$cluster_codes$merging_louvain <- factor(mergetab$new_cluster)
+```
+
+## MONOCLE 3 pseudotime analysis
+
+
+The analysis is mostly based on : https://cole-trapnell-lab.github.io/monocle3/docs/. 
+
+
+
+```{r}
+
+## rna
+rowData(d)$gene_short_name <- paste0(rowData(d)$symbol, ".", rowData(d)$ID)
+cds <- new_cell_data_set(counts(d), cell_metadata = colData(d), gene_metadata = rowData(d))
+colData(cds)$cluster_id <- colData(altExp(d))$cluster_id
+colData(cds)$cluster_name <- plyr::mapvalues(colData(cds)$cluster_id, 
+                                       from = as.numeric(as.character(cluster_codes(altExp(d))$custom)), 
+                                       to = as.character(cluster_codes(altExp(d))$merging_louvain))
+colData(cds)$cluster_id <- droplevels(colData(cds)$cluster_id )
+colData(cds)$cluster_name <- droplevels(colData(cds)$cluster_name )
+
+```
+
+
+`Monocle` pseudotime analysis requires separate preprocessing steps: 
+
+- normalization and dimension reduction
+
+- batch effect removal (using `batchelor`)
+
+- clustering
+
+i.e., **it will not use the preprocessing (normalization, clustering) that was done in our analysis and start again from the raw counts data.** 
+
+## Trajectory graph 
+
+Below, a UMAP plot of the data. It is different from the other UMAP plots of the analysis as we are using `Monocle`-specific functions. The groups of cells that we can observe is also not well overlapping with the cell labels as `Monocle` performed UMAP on the **RNA information**, while the cell labels were inferred from the **protein information**. 
+
+```{r, fig.width=9, fig.height=6}
+
+
+# Select HVG to speed up MONOCLE process ()
+batch <- d$Sample
+dec.d_rna <- modelGeneVar(d, block = batch)
+chosen.hvgs <- getTopHVGs(dec.d_rna, n=1000)
+
+## Step 1: Normalize and pre-process the data
+cds <- preprocess_cds(cds, num_dim = 100, 
+                      use_genes = chosen.hvgs)
+## Step 2: Remove batch effects with cell alignment
+cds <- align_cds(cds, alignment_group = "Sample")
+## Step 3: Reduce the dimensions using UMAP
+cds <- reduce_dimension(cds, cores = 10)
+
+
+
+```
+
+Then, `Monocle` clusters the data and fit a principal graph on each partition of the data, which will be required for the pseudotime analysis:
+
+```{r, fig.width=9, fig.height=6}
+
+
+## Step 4: Cluster the cells
+cds <- cluster_cells(cds, k = 50) # increased k to have lower resolution
+
+## Step 5: Learn a graph
+# use_partition = false to connect branches, if needed
+cds <- learn_graph(cds) 
+
+plot_cells(cds,
+           color_cells_by = "cluster_name",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE, label_principal_points = TRUE) 
+
+
+```
+
+
+
+```{r, fig.width=9, fig.height=6}
+## Step 6: Order cells
+# a helper function to identify the root principal points:
+ROOT = "XXX"
+get_earliest_principal_node <- function(cds, root=ROOT){
+  cell_ids <- which(colData(cds)[, "cluster_name"] == root)
+  
+  closest_vertex <-
+  cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <-
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names
+  (which.max(table(closest_vertex[cell_ids,]))))]
+  
+  root_pr_nodes
+}
+# For RNA, choose anchor points
+cds <- order_cells(cds, root_pr_nodes=c("AA", "BB", "CC"))
+
+
+## plotting and showing pseudotime
+# grey cells: lack information to infer pseudotime
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5) 
+```
+
+Plotting the Monocle UMAP, colored by cDC type and pseudotime next to each other for better comparison: 
+
+```{r, fig.width=8, fig.height=4}
+plot_cells(cds,
+           color_cells_by = "cluster_name",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE) + 
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5) 
+```
+
+Plotting the Monocle UMAP for cDC cells, highlitghting the sample of origin and condition. This is used to check if condition or sample drives the clusters that we observe on the UMAP: 
+
+```{r, fig.width=9, fig.height=6}
+# plot_cells(cds[ ,sample(1:ncol(cds), ncol(cds))],
+#            color_cells_by = "Sample",
+#            label_cell_groups = FALSE,
+#            label_groups_by_cluster=FALSE,
+#            label_leaves=FALSE,
+#            label_branch_points=FALSE, 
+#            alpha = 0.5) + 
+plot_cells(cds[ ,sample(1:ncol(cds), ncol(cds))],
+           color_cells_by = "condition",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=1.5, 
+           alpha = 0.5) 
+```
+
+```{r, fig.width=8, fig.height=6}
+
+plts <- lapply(unique(colData(cds)$condition), function(x){
+  
+  plot_cells(cds[, colData(cds)$condition == x],
+           color_cells_by = "condition",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE, 
+           alpha = 0.5) 
+  
+})
+patchwork::wrap_plots(plts)
+```
+
+
+```{r, include=FALSE, eval=FALSE}
+## 3D plots, not relevant ATM
+# cds_3d <- reduce_dimension(cds, max_components = 3)
+# cds_3d <- cluster_cells(cds_3d, k = 50)
+# cds_3d <- learn_graph(cds_3d, use_partition = FALSE)
+# cds_3d <- order_cells(cds_3d, root_pr_nodes=get_earliest_principal_node(cds_3d, ROOT))
+# colData(cds_3d)$cluster_name <- as.character(colData(cds_3d)$cluster_name)
+# cds_3d_plot_obj <- plot_cells_3d(cds_3d, color_cells_by="cluster_name",)
+# cds_3d_plot_obj
+```
+
+## Population density 
+
+Density of cell-type populations along the pseudotime. The populations in the early pseudotime correspond to the *anchors* that were used to define the graph and should correspond to the early cell populations. 
+
+```{r, fig.width=8, fig.height=8}
+
+
+psuper <- function(cds, var_plot){
+  proj_dt <- data.frame("psuper" = cds@principal_graph_aux[["UMAP"]]$pseudotime,
+                        "label_input" = colData(cds)[, var_plot])
+  # proj_test <- proj_dt#[-which(proj_dt$psuper == Inf),]
+  # new_max <- max(proj_test$psuper) + 2*sd(proj_test$psuper)
+  # proj_dt[which(proj_dt$psuper == Inf),"psuper"] <- new_max
+  # proj_dt[which(proj_dt$psuper == Inf),"psuper"] <- new_max
+  # plot
+    ggplot(proj_dt) +
+        aes( x=psuper, y=label_input, label_input, fill=label_input, colour=label_input ) +
+        geom_density_ridges( alpha=0.5 ) +
+        # scale_fill_manual( values=col_group ) +
+        #geom_vline( data=cuts_dt, aes(xintercept=psuper, colour=label_input) ) +
+        # scale_colour_manual( values=col_group ) +
+        guides(
+            fill    = guide_legend(override.aes = list(alpha=1), reverse = TRUE)
+            ,colour = FALSE
+            ) +
+        labs(
+            x       = 'Pseudotime'
+            ,y      = 'Density'
+            ,fill   = 'cluster_name'
+            ) +
+        theme_bw()
+}
+psuper(cds, "cluster_name") 
+
+```
+
+Population density **per condition** in RNA pseudotime: 
+
+```{r, fig.height=6, fig.width=8}
+plts <- lapply(unique(colData(cds)$condition), function(x){
+  whichsub <- colData(cds)$condition == x
+  cds_sub <- cds[,whichsub]
+  cds_sub@principal_graph_aux[["UMAP"]]$pseudotime <- cds_sub@principal_graph_aux[["UMAP"]]$pseudotime[whichsub]
+  psuper(cds_sub, "cluster_name") + ggtitle(x)
+})
+patchwork::wrap_plots(plts)
+
+```
+
+
+But are the density of pseudotime different between the treatments and the control group ? We can test this with the two-sample Komogorov-Smirnov test, which tests the null hypothesis that the distribution of pseudotime for each cluster are drawn from the same distribution. 
+
+```{r}
+# none condition
+cls <- levels(unique(colData(cds)$cluster_name))
+whichsub <- colData(cds)$condition == "none"
+cds_sub_none <- cds[,whichsub]
+cds_sub_none@principal_graph_aux[["UMAP"]]$pseudotime <- cds_sub_none@principal_graph_aux[["UMAP"]]$pseudotime[whichsub]
+pseudo_dt <- lapply(cls, function(y){
+  data.frame("psuper" = cds_sub_none@principal_graph_aux[["UMAP"]]$pseudotime,
+                        "label_input" = y)
+})
+pseudo_dt_none <- do.call("rbind", pseudo_dt)
+
+kstst <- lapply(c("S1P", "LPS", "LPS_S1P"), function(x){
+  
+  # cds sub for each dondition
+  whichsub <- colData(cds)$condition == x
+  cds_sub <- cds[,whichsub]
+  cds_sub@principal_graph_aux[["UMAP"]]$pseudotime <- cds_sub@principal_graph_aux[["UMAP"]]$pseudotime[whichsub]
+  
+  # preparing pseudotime in df
+  pseudo_dt <- lapply(cls, function(y){
+  data.frame("psuper" = cds_sub@principal_graph_aux[["UMAP"]]$pseudotime,
+                          "label_input" = y)
+  })
+  pseudo_dt <- do.call("rbind", pseudo_dt)
+  
+  tsts <- lapply(cls, function(y){
+    kstest <- ks.test(pseudo_dt$psuper[pseudo_dt$label_input == y], 
+                      pseudo_dt_none$psuper[pseudo_dt_none$label_input == y])
+    kstest$p.value
+  })
+  names(tsts) <- cls
+  tsts <- unlist(tsts)
+  tsts
+})
+names(kstst) <- c("S1P vs none", "LPS vs none", "LPS_S1P vs none")
+kstst
+
+```
+
+
+
+```{r}
+saveRDS(cds, "sce/monocle_rna.rds")
+
+```
+
+
+
+```{r}
+sessionInfo()
+```
+

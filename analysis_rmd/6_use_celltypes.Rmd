@@ -1,5 +1,5 @@
 ---
-title: "Look at Expression markers in azimuth-defined celltypes"
+title: "Look at Expression markers in celltypes"
 author: "Stephany Orjuela & Anthony Sonrel"
 date: "2021-02-17"
 output: 
@@ -15,7 +15,6 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
-linage <- "M"
 torun = TRUE
 ```
 
@@ -34,19 +33,16 @@ suppressPackageStartupMessages({
  library(Seurat)
  })
 
-linage
 ```
 
 
 ```{r, fig.width = 10, fig.height= 10}
-#load object after running azimuth online
-annots <- read.table(sprintf("sce/%s/azimuth_pred.tsv", linage), sep = '\t', header = TRUE)
+#load object
+annots <-  read.csv("metadata/annotation.csv", header = TRUE, stringsAsFactors = FALSE)
 
 #load RNA-filtered SCE
-#d <- readRDS(sprintf("sce/%s/d_rna_filt.rds", linage))
-d <- readRDS(sprintf("sce/%s/d_adt_clust.rds", linage))
+d <- readRDS("sce/d_adt_clust.rds")
 #d <- d[, Cells(umap)]
-#reducedDim(d, "UMAP_azimuth") <- umap@cell.embeddings
 
 idx <- match(colnames(d), annots$cell)
 colData(d)$predicted.id <- annots$predicted.celltype.l2[idx]
@@ -58,10 +54,10 @@ table(d$predicted.id)
 #remove clusters with < 10 cells
 d <- d[,!d$predicted.id %in% names(which(table(d$predicted.id)< 10))]
 
-saveRDS(d, sprintf("sce/%s/d_adt_annot.rds", linage))
+saveRDS(d, "sce/d_adt_annot.rds")
 ```
 
-## Look at RNA UMAP with azimuth annotations
+## Look at RNA UMAP with annot annotations
 
 ```{r, fig.width = 10, fig.height= 10}
 source("scripts/getUMAPclusters.R")
@@ -73,7 +69,7 @@ plotDR(d, color_by = "predicted.id", assay = "logcounts", dr = "UMAP") +
 
 
 ```{r, fig.width = 10, fig.height= 10}
-#azimuth projection
+#annot projection
 by_text <- getUMAPclusters(d, coldata = "predicted.id", meta = NULL, dr = "UMAP") 
 plotDR(d, color_by = "predicted.id", assay = "logcounts", dr = "UMAP") +
   geom_point(alpha = 0.3, size = 0.5) +
@@ -113,7 +109,7 @@ markers <- scran::findMarkers(d,
 
 #organize tables to export in csv per celltype
 celltypes <- names(markers)
-dir.create(sprintf("reports/%s/TABLES/", linage))
+dir.create("reports/TABLES/")
 
 samecols <- sapply(celltypes, function(u){
     subdf <- data.frame(markers[[u]][,c("p.value","FDR","summary.logFC")])
@@ -124,8 +120,8 @@ samecols <- sapply(celltypes, function(u){
     #only export tables with something
     if(nrow(subdf) > 0) {
     write.csv(subdf, 
-              file = sprintf("reports/%s/TABLES/DE_genes_against_%s_%s.csv",
-                             linage,testf, u))
+              file = sprintf("reports/TABLES/DE_genes_against_%s_%s.csv",
+                             testf, u))
     }
   })
 
@@ -144,7 +140,6 @@ mark_per_clus
 ```
 
 
-```
 
 ```{r}
 umarks <- unique(unlist(mark_per_clus))
@@ -156,9 +151,9 @@ umarks <- unique(unlist(mark_per_clus))
 #add metadata to sce
 metadata(d)$cluster_codes <- data.frame(
   custom = factor(1:length(unique(d$predicted.id))),
-  azimuth = factor(unique(d$predicted.id)))
+  annot = factor(unique(d$predicted.id)))
 
-idx <- match(d$predicted.id, metadata(d)$cluster_codes$azimuth)
+idx <- match(d$predicted.id, metadata(d)$cluster_codes$annot)
 d$cluster_id <- metadata(d)$cluster_codes$custom[idx]
 
 #set to plot RNA heatmap
@@ -170,13 +165,13 @@ colData(dsub) <- colData(dsub)[,c("Sample", "sample_id", "patient_id", "conditio
 #                 bars = TRUE, row_clust = FALSE, scale = "last")
 
 #cluster heatmap
-plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "azimuth",
+plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "annot",
                 scale = "never", row_clust = FALSE, assay = "logcounts")
 ```
 
 
 ```{r, fig.width = 10, fig.height= 10}
-plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "azimuth",
+plotExprHeatmap(dsub, by = "cluster_id", k = "custom", m = "annot",
                 scale = "first", row_clust = FALSE, assay = "logcounts")
 ```
 
@@ -198,9 +193,9 @@ library(RColorBrewer)
 library(ComplexHeatmap)
 library(circlize)
 })
-dir.create(sprintf("reports/%s/HEATMAPS",linage))
+dir.create("reports/HEATMAPS")
 #png("test.png", width = 1000, height = 1500)
-pdf(sprintf("reports/%s/HEATMAPS/heatmap_markers_long.pdf",linage), width = 11, height = 14)
+pdf("reports/HEATMAPS/heatmap_markers_long.pdf"), width = 11, height = 14)
 source("scripts/plotExprHeatmapLarge.R")
 set.seed(111000)
 plotExprHeatmapFull(dsub, features = umarks, 

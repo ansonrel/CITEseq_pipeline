@@ -15,8 +15,6 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
 torun = TRUE
-# TODO for compiling: 
-.libPaths(c("/usr/local/lib/R/site-library", "/usr/local/lib/R/library", "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0"))
 ```
 
 ## Load packages
@@ -34,7 +32,7 @@ suppressPackageStartupMessages({
  library(scran, lib.loc = "/usr/local/lib/R/site-library")
  library(patchwork, lib.loc = "/usr/local/lib/R/site-library")
  library(ggridges, lib.loc = "/usr/local/lib/R/site-library")
-   library(RColorBrewer, lib.loc = "/usr/local/lib/R/site-library")
+ library(RColorBrewer, lib.loc = "/usr/local/lib/R/site-library")
  library(circlize, lib.loc = "/usr/local/lib/R/site-library")
  library(patchwork, lib.loc = "/usr/local/lib/R/site-library")
  })
@@ -46,7 +44,7 @@ d <- readRDS("sce/d_adt_clust.rds")
 
 ## merge clusters with manual clustering
 ```{r}
-mergetab <- read.csv("manual_annotation_131221.csv", header = TRUE, stringsAsFactors = FALSE)
+mergetab <- read.csv("metadata/annotation.csv", header = TRUE, stringsAsFactors = FALSE)
 ```
 
 

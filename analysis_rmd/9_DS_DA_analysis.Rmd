@@ -16,31 +16,29 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, dev = c("png", "pdf"))
 torun <- TRUE
-# TODO for compiling: 
-.libPaths(c("/usr/local/lib/R/site-library", "/usr/local/lib/R/library",
-            "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0"))
 ```
 
 
 ```{r}
+
 suppressPackageStartupMessages({
-   library(tibble, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
-  library(magrittr, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
-  library(reshape2)
-  library(viridisLite, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
-  library(dplyr, lib.loc = "/home/asonrel/R/x86_64-pc-linux-gnu-library/4.0")
- library(SingleCellExperiment)
- library(CATALYST)
- library(muscat)
- library(ggplot2)
- library(purrr) 
- library(msigdbr)
- library(fgsea)
- library(ggrepel)
- library(gridExtra)
- library(limma)
- library(monocle3)
- library(patchwork)
+library(tibble)
+library(magrittr)
+library(reshape2)
+library(viridisLite)
+library(dplyr)
+library(SingleCellExperiment)
+library(CATALYST)
+library(muscat)
+library(ggplot2)
+library(purrr) 
+library(msigdbr)
+library(fgsea)
+library(ggrepel)
+library(gridExtra)
+library(limma)
+library(monocle3)
+library(patchwork)
 library(viridis)
 })
 
@@ -59,8 +57,9 @@ meta <- metadata(d)
 reducedDim(d, "UMAP.ADT") <- reducedDim(altExp(d), "UMAP")
 altd <- altExp(d)
 
-mergetab <- read.csv("manual_annotation_131221.csv", header = TRUE, stringsAsFactors = FALSE)
+mergetab <- read.csv("metadata/annotation.csv", header = TRUE, stringsAsFactors = FALSE)
 altd <- altExp(d)
+
 ```
 
 ## Setup
@@ -431,7 +430,7 @@ try(round(edgeR::topTags(fit, n = Inf)$table, 3))
 ```
 
 
-#### CAMERA gene set enrichmient
+#### CAMERA gene set enrichment
 
 We can now test our DEGs against gene sets pathways and highlight pathways that could be modified by the experiment. We are going to use `Limma`'s `CAMERA` tool. From their documentation: 
 
@@ -865,7 +864,7 @@ try(round(edgeR::topTags(fit, n = Inf)$table, 3))
 ```
 
 
-#### CAMERA gene set enrichmient
+#### CAMERA gene set enrichment
 
 We can now test our DEGs against gene sets pathways and highlight pathways that could be modified by the experiment. We are going to use `Limma`'s `CAMERA` tool. From their documentation: 
 
@@ -1298,7 +1297,7 @@ try(write.csv(fit$table, file = sprintf("reports/TABLES/DAanalysis_%s_filt.csv",
 try(round(edgeR::topTags(fit, n = Inf)$table, 3))
 ```
 
-#### CAMERA gene set enrichmient
+#### CAMERA gene set enrichment
 
 We can now test our DEGs against gene sets pathways and highlight pathways that could be modified by the experiment. We are going to use `Limma`'s `CAMERA` tool. From their documentation: 
 

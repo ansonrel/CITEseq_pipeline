@@ -31,9 +31,10 @@ suppressPackageStartupMessages({
 ```
 
 ```{r, eval = FALSE, include = FALSE}
-# for testing: 
+# for interactive session to test one specific sample
 fileName="W8"
-inputFolder=paste0("/home/Shared_s3it/asonrel/CITEseq/round9/alevin/HTO/",fileName,"/alevin/quants_mat.gz")
+inputFolder=paste0("alevin/HTO/",fileName,"/alevin/quants_mat.gz")
+metadataFile="metadata/metadata.csv"
 ```
 
 
@@ -52,7 +53,7 @@ file.exists(hto.files)
 hto <- tximport(files = hto.files, type = "alevin")
 
 #read metadata
-sample_key <- read.table("/home/asonrel/projects/krieg_REAPseq/Round9/metadata.csv",
+sample_key <- read.table(metadataFile,
                        header = TRUE,
                        sep = ",",
                        stringsAsFactors = FALSE)
